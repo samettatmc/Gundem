@@ -11,20 +11,17 @@ Kişisel görev uygulaman. **Android** ve **Windows** uygulaması olarak çalı�
 
 ## İlk kurulum (bir kez)
 
-Depo **özel (private)**: GitHub profilinde kimse göremez. Uygulamalar güncellemeleri şöyle alır:
-- **Windows:** sadece okuma yetkili bir anahtarla (UPDATE_TOKEN) GitHub'dan, kendiliğinden.
-- **Android:** GitHub her derlemede yeni APK'yı Supabase'deki özel `surumler` kutusuna koyar. Uygulama orada yeni sürüm görürse "Yeni sürüm hazır → Güncelle" der. GitHub'a giriş gerekmez; kutuyu sadece uygulamaya giriş yapmış kişi (sen) okuyabilir.
+Depo **açık (public)**: kodu başkaları görebilir, görevlerin Supabase'de şifreyle korunur, kimse göremez.
 
-1. **Supabase:** SQL Editor'de `supabase/002_surumler.sql` içeriğini çalıştır. **Authentication → Sign In / Providers** bölümünde **Allow new users to sign up** kapalı olsun (yoksa başkası hesap açıp dosyaları okuyabilir).
-2. **Depo özel olsun:** github.com → depo → **Settings** → en altta **Change repository visibility → Make private**.
-3. **Gizli bilgiler:** depo → **Settings → Secrets and variables → Actions → New repository secret**:
-   - `ANDROID_KEYSTORE` ve `ANDROID_KEYSTORE_PASSWORD`: Belgeler'deki `Gundem-GIZLI-imza-anahtari.txt` dosyasından.
-   - `SUPABASE_SERVICE_KEY`: Supabase → **Project Settings → API Keys → Legacy API keys** → **service_role** (secret) anahtarı. Bunu başka hiçbir yere yapıştırma.
-   - `UPDATE_TOKEN`: github.com → profil resmi → **Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token** → Repository access: **Only select repositories → Gundem**, Permissions: **Contents: Read-only** → oluşan `github_pat_...` metni.
-4. **Derleme tarifi:** `kurulum\derle.yml` dosyasını Not Defteri ile aç, tamamını kopyala. github.com'da deponda **Add file → Create new file** → dosya adı `.github/workflows/derle.yml` → yapıştır → **Commit changes**. Sonra GitHub Desktop'ta **Fetch origin → Pull origin**.
-5. **İlk kurulum dosyaları:** Derleme (~15 dk) bitince depo → **Releases**:
-   - **Windows:** `Gundem-Kurulum-1.0.X.exe` indir, çalıştır. "Windows bilgisayarınızı korudu" çıkarsa **Ek bilgi → Yine de çalıştır**.
-   - **Android:** İlk APK'yı telefona bir kez aktarman gerekir (depo özel). En kolayı: bilgisayarda Releases'ten `Gundem.apk`'yı indir, kendine e-postayla ya da Google Drive'la gönder, telefonda aç. Sonraki güncellemeler uygulama içinden gelir.
+1. **Supabase:** **Authentication → Sign In / Providers** bölümünde **Allow new users to sign up** kapalı olsun.
+2. **Gizli bilgiler:** depo → **Settings → Secrets and variables → Actions → New repository secret**:
+   `ANDROID_KEYSTORE` ve `ANDROID_KEYSTORE_PASSWORD` (Belgeler'deki `Gundem-GIZLI-imza-anahtari.txt` dosyasından).
+3. **Derleme tarifi:** `kurulum\derle.yml` dosyasını Not Defteri ile aç, tamamını kopyala. github.com'da deponda **Add file → Create new file** → dosya adı `.github/workflows/derle.yml` → yapıştır → **Commit changes**. Sonra GitHub Desktop'ta **Fetch origin → Pull origin**.
+4. **Kur:** Derleme (~15 dk) bitince depo → **Releases**:
+   - **Windows:** `Gundem-Kurulum-1.0.X.exe` indir, çalıştır. Uyarı çıkarsa **Ek bilgi → Yine de çalıştır**.
+   - **Android:** Telefonda Releases sayfasını aç, `Gundem.apk`'yı indir ve aç. Sonraki güncellemeler uygulama içindeki **Güncelle** şeridinden gelir.
+
+İleride depo özel yapılmak istenirse: `supabase/002_surumler.sql` çalıştırılır, `SUPABASE_SERVICE_KEY` ve `UPDATE_TOKEN` secret'ları eklenir; kod iki modu da destekliyor.
 
 ## Güncelleme yapmak
 1. Claude'dan değişikliği iste. Claude bu klasördeki dosyaları düzenler.

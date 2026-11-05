@@ -1,0 +1,9 @@
+node_modules/
+www/
+dist/
+android/
+*.jks
+*.keystore
+electron/update.json
+.DS_Store
+Thumbs.db

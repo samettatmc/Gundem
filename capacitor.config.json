@@ -1,0 +1,9 @@
+{
+  "appId": "com.samet.gundem",
+  "appName": "Gündem",
+  "webDir": "www",
+  "backgroundColor": "#0E131B",
+  "android": {
+    "adjustMarginsForEdgeToEdge": "auto"
+  }
+}

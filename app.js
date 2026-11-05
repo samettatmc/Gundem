@@ -824,27 +824,41 @@ if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol) && !IS_A
 
 /* ---------- Android güncelleme kontrolü ----------
  * Windows uygulaması kendini arka planda günceller.
- * Android: GitHub her derlemede yeni APK'yı Supabase'deki özel "surumler" kutusuna koyar.
- * Uygulama (giriş yapmış olduğun için) oraya bakar; yeni sürüm varsa üstte bir şerit çıkar.
- * Kutu özel olduğu için APK'yı senden başkası indiremez.
+ * Android: açık depoda GitHub Releases'e, özel depoda Supabase'deki "surumler" kutusuna bakar;
+ * yeni sürüm varsa üstte "Güncelle" şeridi çıkar.
  */
 let updChecked = false;
+let updUrl = null;
+function showUpdBar(build, note){
+  const u = $('updBar');
+  u.innerHTML = `<span><b>Yeni sürüm hazır</b><small>1.0.${+build}${note ? ' · ' + esc(note) : ''}</small></span><button class="btn glow" data-act="updGo">Güncelle</button><button class="v-x" data-act="updClose" aria-label="Kapat">×</button>`;
+  u.hidden = false;
+}
 async function checkAppUpdate(){
   if (!IS_ANDROID || !sb || !userId || updChecked) return;
   updChecked = true;
+  // Açık depo: GitHub'daki son sürüme doğrudan bakılır.
+  if (BUILD.repo && !BUILD.token){
+    try{
+      const r = await fetch(`https://api.github.com/repos/${BUILD.repo}/releases/latest`, { headers: { Accept: 'application/vnd.github+json' } });
+      if (!r.ok){ updChecked = false; return; }
+      const j = await r.json(), n = +String(j.tag_name || '').split('.').pop();
+      const apk = (j.assets || []).find(a => /\.apk$/i.test(a.name));
+      if (apk && n > (BUILD.build || 0)){ updUrl = apk.browser_download_url; showUpdBar(n, (j.body || '').split('\n')[0].slice(0, 80)); }
+    } catch(e){ updChecked = false; }
+    return;
+  }
+  // Özel depo: APK Supabase'deki özel "surumler" kutusunda.
   try{
     const { data, error } = await sb.storage.from('surumler').createSignedUrl('version.json', 60);
     if (error || !data) return;
     const r = await fetch(data.signedUrl + '&t=' + Date.now(), { cache: 'no-store' }); if (!r.ok) return;
     const v = await r.json();
-    if (+v.build > (BUILD.build || 0)){
-      const u = $('updBar');
-      u.innerHTML = `<span><b>Yeni sürüm hazır</b><small>1.0.${+v.build}${v.note ? ' · ' + esc(v.note) : ''}</small></span><button class="btn glow" data-act="updGo">Güncelle</button><button class="v-x" data-act="updClose" aria-label="Kapat">×</button>`;
-      u.hidden = false;
-    }
+    if (+v.build > (BUILD.build || 0)) showUpdBar(v.build, v.note);
   } catch(e){ updChecked = false; }
 }
 async function startUpdate(btn){
+  if (updUrl){ toast('İndiriliyor… Bitince bildirimden aç ve Yükle de.'); location.href = updUrl; return; }
   btn.disabled = true; btn.textContent = 'Hazırlanıyor…';
   const { data, error } = await sb.storage.from('surumler').createSignedUrl('Gundem.apk', 3600, { download: 'Gundem.apk' });
   if (error || !data){ btn.disabled = false; btn.textContent = 'Güncelle'; toast('İndirme bağlantısı alınamadı, internetini kontrol et.'); return; }

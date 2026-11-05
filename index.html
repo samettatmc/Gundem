@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Gündem</title>
+<meta name="theme-color" content="#141E33">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+<div class="grain" aria-hidden="true"></div>
+
+<!-- Giriş ekranı -->
+<section id="auth" class="auth" hidden>
+  <div class="auth-card">
+    <div class="logo"><img src="icons/icon-192.png" alt="" width="64" height="64"></div>
+    <h1>Gündem</h1>
+    <p class="muted" id="authSub">Bu cihazda bir kez giriş yapman yeterli, sonra hep açık kalır.</p>
+    <form id="authForm" autocomplete="on">
+      <label for="email">E-posta</label>
+      <input id="email" type="email" autocomplete="email" required>
+      <label for="password">Şifre</label>
+      <input id="password" type="password" autocomplete="current-password" minlength="6" required>
+      <button class="btn" type="submit" id="authBtn">Giriş yap</button>
+      <button class="link" type="button" id="authSwitch">İlk kez mi kullanıyorsun? Hesap oluştur</button>
+      <p class="err" id="authErr" hidden></p>
+    </form>
+  </div>
+</section>
+
+<!-- Kurulum eksik ekranı -->
+<section id="setup" class="auth" hidden>
+  <div class="auth-card">
+    <h1>Kurulum eksik</h1>
+    <p class="muted">config.js dosyasına Supabase adresini ve anahtarını eklemen gerekiyor. BENIOKU.md dosyasındaki adımlara bak.</p>
+  </div>
+</section>
+
+<!-- Uygulama -->
+<div id="app" class="wrap" hidden>
+  <header>
+    <div class="hd-text">
+      <div class="greet" id="greet">Günaydın</div>
+      <div class="day" id="day">Bugün</div>
+      <div class="date" id="date"></div>
+    </div>
+    <div class="head-right">
+      <div class="ring" id="ring" title="Bugün biten">
+        <svg viewBox="0 0 64 64" aria-hidden="true">
+          <defs><linearGradient id="rg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" class="s1"/><stop offset="1" class="s2"/></linearGradient></defs>
+          <circle class="trk" cx="32" cy="32" r="27"/><circle class="val" id="ringVal" cx="32" cy="32" r="27"/>
+        </svg>
+        <b id="progTxt">0/0</b>
+      </div>
+      <button class="menu-btn" id="menuBtn" aria-label="Menü"><span></span><span></span><span></span></button>
+    </div>
+  </header>
+  <nav role="tablist" id="tabs"></nav>
+  <div id="banner" class="banner" hidden></div>
+  <main id="view"></main>
+</div>
+
+<div class="add" id="addBar" hidden>
+  <form id="addForm" autocomplete="off">
+    <div class="hint" id="hint" hidden></div>
+    <div class="chips" id="addChips"></div>
+    <div class="line">
+      <div class="inp-wrap"><input id="q" type="text" placeholder="Görev ekle… (ör. faturayı öde yarın)" enterkeyhint="done" aria-label="Yeni görev"></div>
+      <button class="mic" type="button" id="micBtn" data-act="mic" aria-label="Sesle ekle"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+      <button class="go" type="submit" aria-label="Ekle"><span>+</span></button>
+    </div>
+  </form>
+</div>
+
+<div id="updBar" class="upd" hidden></div>
+<div id="sheet" class="scrim" hidden></div>
+<div id="toast" class="toast" hidden></div>
+
+<script src="vendor/capacitor.js"></script>
+<script src="build-info.js"></script>
+<script src="config.js"></script>
+<script src="vendor/supabase.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
