@@ -5,6 +5,10 @@ const path = require('path');
 const fs = require('fs');
 
 if (!app.requestSingleInstanceLock()) app.quit();
+
+// Tarayıcı kimliğinde (User-Agent) "Gündem" adındaki ü harfi bozuk gidiyor ve
+// Supabase girişte "Database error granting user" hatası veriyor. Kimliği sadece ASCII harflerle gönder.
+app.userAgentFallback = app.userAgentFallback.replace(/G\S*ndem\//g, 'Gundem/').replace(/[^\x20-\x7E]/g, '');
 let win;
 
 function createWindow(){
