@@ -9,7 +9,7 @@
 'use strict';
 
 /* ---------- 1. Sabitler ---------- */
-const VERSION = '3.0.0';
+const VERSION = '3.0.1';
 // Hangi ortamda çalışıyoruz: Android uygulaması, Windows uygulaması ya da tarayıcı
 const BUILD = window.GUNDEM_BUILD || { build: 0, repo: '' };
 const IS_ANDROID = !!(window.Capacitor && window.Capacitor.getPlatform && window.Capacitor.getPlatform() === 'android');
@@ -288,9 +288,15 @@ let calMode = (() => { try { return localStorage.getItem('gundem-calmode') || 'w
 let calSel = TODAY, calAnchor = TODAY;
 const weekStart = d => addDays(d, -((pd(d).getDay() + 6) % 7));
 const monthStart = d => d.slice(0, 8) + '01';
+// Takvimde bir iş hangi günde görünür: bugüne seçildiyse bugün, değilse kendi tarihinde.
+function planDay(t){
+  if (!t.done && t.pickedFor === TODAY && !isLate(t)) return TODAY;
+  if (t.date) return t.date;
+  if (t.pickedFor) return t.pickedFor;
+  return t.done ? t.doneAt : null;
+}
 function dayTasks(d){
-  return all().filter(t => t.date === d || (!t.date && t.pickedFor === d) || (!t.date && !t.pickedFor && t.done && t.doneAt === d))
-    .sort((a,b) => (a.done - b.done) || byCreated(a,b));
+  return all().filter(t => planDay(t) === d).sort((a,b) => (a.done - b.done) || byCreated(a,b));
 }
 function dotsHTML(list, max){
   const dots = list.slice(0, max).map(t => `<i class="${t.done ? 'd-done' : isLate(t) ? 'd-late' : ''}" style="--cc:var(--c-${t.cat || 'none'}, var(--accent))"></i>`).join('');
@@ -547,10 +553,17 @@ document.addEventListener('click', e => {
 });
 $('menuBtn').addEventListener('click', openMenu);
 $('sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSheet(); });
+// "Bugün ✓"e basınca: sonradan bugüne seçilmiş iş kendi tarihine döner;
+// tarihi zaten bugün (ya da geçmiş) olan iş yarına geçer. İkisi de "Geri al" ile geri alınabilir.
 function unpin(id, t){
-  const p = { pickedFor: null };
-  if (t.date && t.date <= TODAY) p.date = addDays(TODAY, 1);
-  patch(id, p); if (p.date) toast('Tarihi yarına alındı');
+  const before = { date: t.date || null, pickedFor: t.pickedFor || null };
+  if (!(t.date && t.date <= TODAY)){
+    patch(id, { pickedFor: null });
+    toast(t.date ? 'Bugünden çıkarıldı · ' + dLabel(t.date) + ' gününe döndü' : 'Bugünden çıkarıldı', () => patch(id, before));
+  } else {
+    patch(id, { pickedFor: null, date: addDays(TODAY, 1) });
+    toast('Yarına taşındı', () => patch(id, before));
+  }
 }
 function rollAll(){
   const tm = addDays(TODAY, 1);
