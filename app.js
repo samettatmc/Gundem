@@ -9,12 +9,28 @@
 'use strict';
 
 /* ---------- 1. Sabitler ---------- */
-const VERSION = '3.1.0';
+const VERSION = '3.2.0';
 // Hangi ortamda çalışıyoruz: Android uygulaması, Windows uygulaması ya da tarayıcı
 const BUILD = window.GUNDEM_BUILD || { build: 0, repo: '' };
 const IS_ANDROID = !!(window.Capacitor && window.Capacitor.getPlatform && window.Capacitor.getPlatform() === 'android');
 const IS_DESKTOP = !!window.gundemDesktop;
-const CATS = { is: 'İş', ev: 'Ev', okul: 'Okul', kisi: 'Kişisel' };
+// Kategoriler kullanıcı tarafından düzenlenebilir (⋯ → Kategoriler). Burada sadece varsayılanlar var;
+// gerçek liste "prefs" ile Supabase'de saklanır ve iki cihazda ortaktır.
+const PALETTE = ['#2a78d6','#eb6834','#1baf7a','#eda100','#e87ba4','#008300','#6250d6','#e34948','#868e96'];
+const DEFAULT_PREFS = {
+  taskCats: [ { id:'is', name:'Fellystar', color:'#2a78d6' }, { id:'ev', name:'Ev', color:'#1baf7a' }, { id:'okul', name:'Okul', color:'#6250d6' },
+              { id:'kisi', name:'Kişisel', color:'#eb6834' }, { id:'sammetry', name:'Sammetry', color:'#e87ba4' } ],
+  wallet: {
+    in:  [ { id:'maas', name:'Fellystar', color:'#2a78d6' }, { id:'harclik', name:'Harçlık', color:'#1baf7a' }, { id:'satis', name:'Satış', color:'#eda100' }, { id:'diger', name:'Diğer', color:'#868e96' } ],
+    out: [ { id:'yemek', name:'Yemek', color:'#eda100' }, { id:'market', name:'Market', color:'#1baf7a' }, { id:'ulasim', name:'Ulaşım', color:'#2a78d6' },
+           { id:'fatura', name:'Fatura', color:'#e34948' }, { id:'kira', name:'Kira', color:'#6250d6' }, { id:'alisveris', name:'Alışveriş', color:'#e87ba4' },
+           { id:'eglence', name:'Eğlence', color:'#eb6834' }, { id:'saglik', name:'Sağlık', color:'#008300' }, { id:'egitim', name:'Eğitim', color:'#3987e5' },
+           { id:'abonelik', name:'Abonelik', color:'#d95926' }, { id:'diger', name:'Diğer', color:'#868e96' } ],
+  },
+};
+let prefs = JSON.parse(JSON.stringify(DEFAULT_PREFS));
+const CATS = {};   // id → ad (görevler); prefs'ten doldurulur
+const tColor = k => ((prefs.taskCats.find(c => c.id === k) || {}).color) || 'var(--muted)';
 const DAYS = ['Pazar','Pazartesi','Salı','Çarşamba','Perşembe','Cuma','Cumartesi'];
 const MONS = ['ocak','şubat','mart','nisan','mayıs','haziran','temmuz','ağustos','eylül','ekim','kasım','aralık'];
 const MONL = MONS.map(m => m[0].toLocaleUpperCase('tr') + m.slice(1));
@@ -194,7 +210,10 @@ function setOnline(v){ if (online !== v){ online = v; renderBanner(); } }
 
 async function reload(){
   if (!sb || !userId) return;
-  const [{ data, error }, w] = await Promise.all([sb.from('tasks').select('*').limit(5000), sb.from('wallet').select('*').limit(10000)]);
+  const [{ data, error }, w, pr] = await Promise.all([sb.from('tasks').select('*').limit(5000), sb.from('wallet').select('*').limit(10000),
+    sb.from('prefs').select('data').eq('user_id', userId).maybeSingle()]);
+  if (pr.error) prefsRemote = false;
+  else { prefsRemote = true; if (pr.data && pr.data.data) { setPrefs(pr.data.data); lsSet('gundem-prefs-' + userId, prefs); } else savePrefs(); }
   if (error){ setOnline(false); return; }
   setOnline(true);
   tasks.clear(); data.forEach(r => tasks.set(r.id, fromRow(r)));
@@ -210,13 +229,30 @@ function startRealtime(){
   sb.channel('tasks-' + userId)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, () => { if (!outbox.length) reloadSoon(); })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'wallet' }, () => { if (!outbox.length) reloadSoon(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'prefs' }, () => reloadSoon())
     .subscribe();
 }
 
 const addTask = data => queue({ op: 'upsert', task: { id: uuid(), createdAt: Date.now(), done: false, doneAt: null, doneTs: null, pickedFor: null, cat: null, date: null, ...data } });
 const patch = (id, p) => queue({ op: 'update', id, patch: p });
 const removeTask = id => queue({ op: 'delete', id });
-let walletReady = true;
+let walletReady = true, prefsRemote = true, prefsT = null;
+function normPrefs(d){
+  const ok = a => Array.isArray(a) && a.every(c => c && c.id && typeof c.name === 'string');
+  return { taskCats: ok(d && d.taskCats) ? d.taskCats : DEFAULT_PREFS.taskCats,
+           wallet: { in: ok(d && d.wallet && d.wallet.in) ? d.wallet.in : DEFAULT_PREFS.wallet.in,
+                     out: ok(d && d.wallet && d.wallet.out) ? d.wallet.out : DEFAULT_PREFS.wallet.out } };
+}
+function setPrefs(d){ prefs = normPrefs(d); rebuildCats(); }
+function savePrefs(){
+  rebuildCats(); lsSet('gundem-prefs-' + userId, prefs); scheduleRender();
+  clearTimeout(prefsT);
+  prefsT = setTimeout(async () => {
+    if (!sb || !userId || !prefsRemote) return;
+    const { error } = await sb.from('prefs').upsert({ user_id: userId, data: prefs });
+    if (error){ if (isNetErr(error)) setOnline(false); else { prefsRemote = false; toast('Kategoriler sadece bu cihazda kaydedildi (004_ayarlar.sql çalıştırılmamış)'); } }
+  }, 500);
+}
 const addTxn = data => queue({ op: 'upsert', tb: 'wallet', task: { id: uuid(), createdAt: Date.now(), date: TODAY, cat: null, note: null, ...data } });
 const patchTxn = (id, p) => queue({ op: 'update', tb: 'wallet', id, patch: p });
 const removeTxn = id => queue({ op: 'delete', tb: 'wallet', id });
@@ -242,7 +278,7 @@ let tab = 'today', openId = null, confirmDel = null, addDate = null, addCat = nu
 
 function taskHTML(t, ctx){
   const today = isToday(t), late = isLate(t), meta = [];
-  if (t.cat && CATS[t.cat]) meta.push(`<span class="cat" style="--cc:var(--c-${t.cat})">${CATS[t.cat]}</span>`);
+  if (t.cat && CATS[t.cat]) meta.push(`<span class="cat" style="--cc:${tColor(t.cat)}">${CATS[t.cat]}</span>`);
   if (t.done && ctx !== 'today') meta.push(`<span>${dLabel(t.doneAt)} bitti</span>`);
   else if (late){ const n = Math.abs(diffDays(lateSince(t))); meta.push(`<span class="late">${n === 1 ? 'Dünden kaldı' : n + ' gün gecikti'}</span>`); }
   else if (t.date && !(ctx === 'today' && t.date === TODAY) && ctx !== 'group') meta.push(`<span>${dLabel(t.date)}</span>`);
@@ -250,7 +286,7 @@ function taskHTML(t, ctx){
   const pin = (!t.done && ctx !== 'today') ? `<button class="pin ${today?'on':''}" data-act="pin" data-id="${t.id}" aria-pressed="${today}">${today?'Bugün ✓':'Bugüne al'}</button>` : '';
   let edit = '';
   if (openId === t.id){
-    const cats = Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:var(--c-${k})" data-act="cat" data-id="${t.id}" data-v="${k}" aria-pressed="${t.cat===k}">${v}</button>`).join('');
+    const cats = Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:${tColor(k)}" data-act="cat" data-id="${t.id}" data-v="${k}" aria-pressed="${t.cat===k}">${v}</button>`).join('');
     edit = `<div class="edit">
       <textarea rows="1" class="grow" id="ed-${t.id}" data-act="rename" data-id="${t.id}" aria-label="Görev adı">${esc(t.title)}</textarea>
       <div class="chips">
@@ -326,13 +362,13 @@ function dayTasks(d){
   return all().filter(t => planDay(t) === d).sort((a,b) => (a.done - b.done) || byCreated(a,b));
 }
 function dotsHTML(list, max){
-  const dots = list.slice(0, max).map(t => `<i class="${t.done ? 'd-done' : isLate(t) ? 'd-late' : ''}" style="--cc:var(--c-${t.cat || 'none'}, var(--accent))"></i>`).join('');
+  const dots = list.slice(0, max).map(t => `<i class="${t.done ? 'd-done' : isLate(t) ? 'd-late' : ''}" style="--cc:${t.cat ? tColor(t.cat) : 'var(--accent)'}"></i>`).join('');
   return `<span class="dots">${dots}${list.length > max ? `<b>+${list.length - max}</b>` : ''}</span>`;
 }
 function cellHTML(d, outside){
   const list = dayTasks(d), dd = pd(d), open = list.filter(t => !t.done).length;
   const cls = ['cal-cell', d === TODAY && 'is-today', d === calSel && 'is-sel', outside && 'is-out', list.some(isLate) && 'has-late', list.length && !open && 'all-done', d < TODAY && 'is-past'].filter(Boolean).join(' ');
-  const items = list.slice(0, 3).map(t => `<span class="ci ${t.done ? 'done' : isLate(t) ? 'late' : ''}" style="--cc:var(--c-${t.cat || 'none'}, var(--accent))">${esc(t.title)}</span>`).join('');
+  const items = list.slice(0, 3).map(t => `<span class="ci ${t.done ? 'done' : isLate(t) ? 'late' : ''}" style="--cc:${t.cat ? tColor(t.cat) : 'var(--accent)'}">${esc(t.title)}</span>`).join('');
   return `<button class="${cls}" data-act="calDay" data-v="${d}" aria-label="${dd.getDate()} ${MONL[dd.getMonth()]}, ${list.length} iş" aria-pressed="${d === calSel}">
     ${calMode === 'week' ? `<span class="wd">${WD_SHORT[(dd.getDay() + 6) % 7]}</span>` : ''}
     <span class="num">${dd.getDate()}</span>
@@ -398,12 +434,15 @@ function viewDone(){
 /* ---------- Cüzdan ----------
  * Gelir / gider kaydı, aylık özet ve kategori dağılımı. Veriler Supabase "wallet" tablosunda.
  */
-const W_CATS = {
-  out: { yemek:'Yemek', market:'Market', ulasim:'Ulaşım', fatura:'Fatura', kira:'Kira', alisveris:'Alışveriş', eglence:'Eğlence', saglik:'Sağlık', egitim:'Eğitim', abonelik:'Abonelik', diger:'Diğer' },
-  in:  { maas:'Maaş', harclik:'Harçlık', burs:'Burs', satis:'Satış', serbest:'Serbest iş', hediye:'Hediye', diger:'Diğer' },
-};
-const W_COLORS = { yemek:'#F59F00', market:'#37B24D', ulasim:'#1C7ED6', fatura:'#F03E3E', kira:'#AE3EC9', alisveris:'#E64980', eglence:'#7048E8', saglik:'#0CA678', egitim:'#4263EB', abonelik:'#D9480F', diger:'#868E96',
-  maas:'#2F9E44', harclik:'#40C057', burs:'#12B886', satis:'#82C91E', serbest:'#15AABF', hediye:'#FAB005' };
+const W_CATS = { in: {}, out: {} };   // id → ad; prefs'ten doldurulur
+const W_COLORS = {};                   // "kind:id" → renk
+const wColor = (kind, c) => W_COLORS[kind + ':' + c] || '#868e96';
+function rebuildCats(){
+  Object.keys(CATS).forEach(k => delete CATS[k]); prefs.taskCats.forEach(c => { CATS[c.id] = c.name; });
+  ['in','out'].forEach(kind => { Object.keys(W_CATS[kind]).forEach(k => delete W_CATS[kind][k]);
+    prefs.wallet[kind].forEach(c => { W_CATS[kind][c.id] = c.name; W_COLORS[kind + ':' + c.id] = c.color; }); });
+}
+rebuildCats();
 const W_WORDS = {
   out: [['yemek', /yemek|yedim|kahvaltı|öğle|akşam yemeği|restoran|kafe|kahve|döner|pizza|burger|lahmacun|çay|içtim|yemeğe/],
         ['market', /market|bakkal|manav|migros|a101|bim|şok|carrefour|gıda|ekmek|süt/],
@@ -418,15 +457,26 @@ const W_WORDS = {
   in:  [['maas', /maaş/], ['harclik', /harçlık/], ['burs', /burs/], ['satis', /sattım|satış|satıldı/], ['serbest', /proje parası|serbest|freelance|iş parası|ödeme aldım/], ['hediye', /hediye|bayram/]],
 };
 const money = n => { n = Math.round((n || 0) * 100) / 100; const f = n % 1 ? 2 : 0; return new Intl.NumberFormat('tr-TR', { style: 'currency', currency: 'TRY', minimumFractionDigits: f, maximumFractionDigits: f }).format(n); };
-const wCatName = (kind, c) => (W_CATS[kind] && W_CATS[kind][c]) || 'Diğer';
-function guessWCat(kind, text){ const l = low(text); for (const [k, re] of W_WORDS[kind]) if (re.test(l)) return k; return 'diger'; }
+const wCatName = (kind, c) => (W_CATS[kind] && W_CATS[kind][c]) || 'Kategorisiz';
+// Önce kategori adının kendisi (senin eklediklerin dahil), sonra bilinen anahtar kelimeler.
+function guessWCat(kind, text){
+  const l = low(text);
+  for (const c of prefs.wallet[kind]) if (c.id !== 'diger' && c.name.length > 1 && l.includes(low(c.name))) return c.id;
+  for (const [k, re] of W_WORDS[kind]) if (W_CATS[kind][k] && re.test(l)) return k;
+  return W_CATS[kind].diger ? 'diger' : null;
+}
 
 /* Yazılan cümlede para var mı? "560 liraya yemek yedim", "15 bin maaş geldi", "dün markete 340,50 tl"
  * force: cüzdan sayfasındayken "lira" yazmasan da sayı yeterli. */
 const IN_RE = /maaş|harçlık|burs|kazandım|gelir|yattı|yatırıldı|geldi|sattım|satış|prim|ikramiye|iade|hediye geldi|ödeme aldım|aldım parayı/;
 const MONEY_VERB = /harcadım|ödedim|verdim|yedim|içtim|kazandım|yattı|yatırıldı|maaş|harçlık|burs|ödeme|fatura|kira/;
 function parseMoney(text, force){
-  const L = ' ' + low(text) + ' ';
+  let L = ' ' + low(text) + ' ';
+  // İlk kelime "gelir" ya da "gider" ise türü o belirler: "gelir 550 harçlık", "gider 2000 lira klavye"
+  let forcedKind = null;
+  const lead = L.match(/^\s*(gelir|gider)\s/);
+  if (lead){ forcedKind = lead[1] === 'gelir' ? 'in' : 'out'; force = true; L = ' ' + L.slice(lead[0].length); }
+  L = L.replace(/(^|[^\d\s])(\s+)bin(?=\s)/g, '$1$2 1000');   // "bin lira" = 1000
   const numRe = /(\d{1,3}(?:\.\d{3})+|\d+)(?:,(\d{1,2}))?(\s*bin)?(\s*(?:₺|tl|lira|liralık|liraya|lirayı|liram|tl'ye|tl'lik)\b|\s*₺)?/g;
   let best = null, m;
   while ((m = numRe.exec(L))){
@@ -441,7 +491,7 @@ function parseMoney(text, force){
   let amount = parseFloat(mm[1].replace(/\./g, '') + (mm[2] ? '.' + mm[2] : ''));
   if (mm[3]) amount *= 1000;
   if (!amount) return null;
-  const kind = IN_RE.test(L) ? 'in' : 'out';
+  const kind = forcedKind || (IN_RE.test(L) ? 'in' : 'out');
   // tarih: bugün/dün/yarın/gün adı; para için gün adı geçmiş günü anlatır
   let rest = (L.slice(0, mm.index) + ' ' + L.slice(mm.index + mm[0].length)).replace(/\s+/g, ' ');
   let date = TODAY;
@@ -452,7 +502,7 @@ function parseMoney(text, force){
   let note = (' ' + rest + ' ').replace(/(?<=\s)(harcadım|ödedim|ödendi|verdim|yedim|içtim|kazandım|geldi|yattı|yatırıldı|aldım|için|lira|tl|bugün|gider|gelir|olarak|bir|tane)(?=\s)/g, ' ')
                  .replace(/\s+/g, ' ').trim();
   note = note ? note[0].toLocaleUpperCase('tr') + note.slice(1) : wCatName(kind, cat);
-  return { kind, amount: Math.round(amount * 100) / 100, cat, note, date };
+  return { kind, amount: Math.round(amount * 100) / 100, cat, note, date, forced: !!forcedKind };
 }
 
 let walletMonth = TODAY.slice(0, 7), wOpen = null, wConfirm = null, wKind = 'out', wCat = null;
@@ -461,10 +511,10 @@ const shiftMonth = (ym, n) => { const d = new Date(+ym.slice(0, 4), +ym.slice(5,
 const wAll = () => [...txns.values()];
 
 function txnHTML(t){
-  const color = W_COLORS[t.cat] || W_COLORS.diger, sign = t.kind === 'in' ? '+' : '−';
+  const color = wColor(t.kind, t.cat), sign = t.kind === 'in' ? '+' : '−';
   let edit = '';
   if (wOpen === t.id){
-    const cats = Object.entries(W_CATS[t.kind]).map(([k, v]) => `<button type="button" class="chip sm cat" style="--cc:${W_COLORS[k]}" data-act="wcat" data-id="${t.id}" data-v="${k}" aria-pressed="${t.cat===k}">${v}</button>`).join('');
+    const cats = Object.entries(W_CATS[t.kind]).map(([k, v]) => `<button type="button" class="chip sm cat" style="--cc:${wColor(t.kind, k)}" data-act="wcat" data-id="${t.id}" data-v="${k}" aria-pressed="${t.cat===k}">${v}</button>`).join('');
     edit = `<div class="edit">
       <div class="w-edit-row">
         <input type="text" inputmode="decimal" class="w-amt" data-act="wamount" data-id="${t.id}" value="${String(t.amount).replace('.', ',')}" aria-label="Tutar">
@@ -500,6 +550,7 @@ function viewWallet(){
       <span class="cal-title">${monthLabel(walletMonth)}</span>
       <button class="nav-btn" data-act="wNext" aria-label="Sonraki ay">›</button>
     </div>
+    <div class="seg w-seg">${[['list','Hareketler'],['ozet','Özet']].map(([k,l]) => `<button class="chip" data-act="wView" data-v="${k}" aria-pressed="${wView===k}">${l}</button>`).join('')}</div>
     <div class="w-hero">
       <small>${isCur ? 'Bu ay kalan' : monthLabel(walletMonth) + ' sonunda kalan'}</small>
       <b class="w-big ${left < 0 ? 'neg' : ''}">${money(left)}</b>
@@ -508,10 +559,11 @@ function viewWallet(){
       <div class="w-foot"><span>Gelirinin %${pct}'i harcandı</span><span>Günlük ort. gider ${money(out / Math.max(1, daysPassed))}</span></div>
       <div class="w-total">Toplam bakiye (tüm zamanlar) <b class="${total < 0 ? 'neg' : ''}">${money(total)}</b></div>
     </div>`;
+  if (wView === 'ozet') return h + viewWalletSummary();
   if (cats.length){
     h += `<h2><span class="hl"><span class="dot"></span>Nereye harcadım</span><span>${money(out)}</span></h2><div class="w-cats">` +
-      cats.map(([c, v]) => `<div class="w-cat"><span class="w-cat-n"><span class="cat" style="--cc:${W_COLORS[c] || W_COLORS.diger}">${wCatName('out', c)}</span></span>
-        <span class="w-cat-bar"><i style="width:${Math.max(4, v / maxC * 100)}%;background:${W_COLORS[c] || W_COLORS.diger}"></i></span>
+      cats.map(([c, v]) => `<div class="w-cat"><span class="w-cat-n"><span class="cat" style="--cc:${wColor('out', c)}">${wCatName('out', c)}</span></span>
+        <span class="w-cat-bar"><i style="width:${Math.max(4, v / maxC * 100)}%;background:${wColor('out', c)}"></i></span>
         <span class="w-cat-v">${money(v)}<small>%${Math.round(v / out * 100)}</small></span></div>`).join('') + `</div>`;
   }
   const list = M.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0)));
@@ -527,6 +579,7 @@ function viewWallet(){
 function walletClick(act, b){
   const id = b.dataset.id, t = id && txns.get(id);
   switch (act){
+    case 'wView': wView = b.dataset.v; try { localStorage.setItem('gundem-wview', wView); } catch(e){} render(); return true;
     case 'wPrev': walletMonth = shiftMonth(walletMonth, -1); render(); return true;
     case 'wNext': walletMonth = shiftMonth(walletMonth, 1); render(); return true;
     case 'wopen': wOpen = wOpen === id ? null : id; wConfirm = null; render(); return true;
@@ -546,6 +599,128 @@ document.addEventListener('change', e => {
   if (el.dataset.act === 'wamount'){ const v = parseFloat(el.value.replace(/\./g, '').replace(',', '.')); if (v > 0) patchTxn(id, { amount: Math.round(v * 100) / 100 }); else toast('Geçerli bir tutar yaz'); }
   if (el.dataset.act === 'wnote') patchTxn(id, { note: el.value.trim() || null });
 });
+
+/* ---------- Kategori düzenleyici (⋯ → Kategoriler) ---------- */
+let catTab = 'task';   // task | in | out
+const catList = () => catTab === 'task' ? prefs.taskCats : prefs.wallet[catTab];
+function openCats(){
+  sheetKind = 'cats';
+  const list = catList();
+  const rows = list.map((c, i) => `<div class="cat-row">
+      <button class="cdot" data-act="cColor" data-i="${i}" style="background:${c.color || '#868e96'}" aria-label="Rengi değiştir"></button>
+      <input type="text" class="cname" data-i="${i}" value="${esc(c.name)}" aria-label="Kategori adı" maxlength="24">
+      <button class="v-x" data-act="cUp" data-i="${i}" aria-label="Yukarı taşı" ${i ? '' : 'disabled'}>↑</button>
+      <button class="v-x danger" data-act="cDel" data-i="${i}" aria-label="Sil">×</button></div>`).join('');
+  $('sheet').innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Kategoriler">
+    <h3>Kategoriler</h3><p class="sub">Adına dokunup değiştir, renk için noktaya dokun. Silinen kategorideki kayıtlar silinmez, kategorisiz kalır.${prefsRemote ? '' : ' <b>Not:</b> iki cihazda ortak olması için supabase/004_ayarlar.sql çalıştırılmalı.'}</p>
+    <div class="seg cat-seg">${[['task','Ajanda'],['in','Gelir'],['out','Gider']].map(([k,l]) => `<button class="chip" data-act="cTab" data-v="${k}" aria-pressed="${catTab===k}">${l}</button>`).join('')}</div>
+    <div class="scroll">${rows || '<div class="cal-empty">Hiç kategori yok.</div>'}
+      <form class="cat-add" id="catAdd"><input type="text" id="catNew" placeholder="Yeni kategori adı" maxlength="24" aria-label="Yeni kategori"><button class="btn" type="submit">Ekle</button></form>
+    </div>
+    <div class="foot"><button class="btn" data-act="closesheet">Tamam</button></div></div>`;
+  $('sheet').hidden = false;
+}
+function catsClick(act, b){
+  const i = +b.dataset.i, list = catList();
+  switch (act){
+    case 'cats': openCats(); return true;
+    case 'cTab': catTab = b.dataset.v; openCats(); return true;
+    case 'cColor': { const c = list[i], n = (PALETTE.indexOf(c.color) + 1) % PALETTE.length; c.color = PALETTE[n]; b.style.background = c.color; savePrefs(); return true; }
+    case 'cUp': if (i > 0){ [list[i - 1], list[i]] = [list[i], list[i - 1]]; savePrefs(); openCats(); } return true;
+    case 'cDel': { const [gone] = list.splice(i, 1); savePrefs(); openCats(); toast('“' + gone.name + '” silindi', () => { list.splice(i, 0, gone); savePrefs(); if (sheetKind === 'cats') openCats(); }); return true; }
+  }
+  return false;
+}
+document.addEventListener('change', e => {
+  const el = e.target; if (!el.classList || !el.classList.contains('cname')) return;
+  const c = catList()[+el.dataset.i], v = el.value.trim(); if (c && v && v !== c.name){ c.name = v; savePrefs(); toast('Kaydedildi'); }
+});
+document.addEventListener('submit', e => {
+  if (e.target.id !== 'catAdd') return; e.preventDefault();
+  const v = $('catNew').value.trim(); if (!v) return;
+  const list = catList();
+  if (list.some(c => low(c.name) === low(v))){ toast('Bu adla bir kategori zaten var'); return; }
+  const used = list.map(c => c.color), color = PALETTE.find(p => !used.includes(p)) || PALETTE[list.length % PALETTE.length];
+  list.push({ id: 'c' + Date.now().toString(36), name: v, color }); savePrefs(); openCats();
+  const inp = $('catNew'); if (inp) inp.focus();
+});
+
+/* ---------- Cüzdan özeti (grafikler) ---------- */
+let wView = (() => { try { return localStorage.getItem('gundem-wview') || 'list'; } catch(e){ return 'list'; } })();
+function donutSVG(parts, total){
+  // parts: [{ name, value, color }]; 2px boşlukla ayrılmış halka dilimleri
+  const R = 70, r = 46, C = 2 * Math.PI * ((R + r) / 2), W = R - r;
+  let off = 0;
+  const segs = parts.map(p => {
+    const len = Math.max(0, p.value / total * C - (parts.length > 1 ? 2 : 0));
+    const el = `<circle class="dn-seg" r="${(R + r) / 2}" cx="90" cy="90" fill="none" stroke="${p.color}" stroke-width="${W}" stroke-dasharray="${len} ${C - len}" stroke-dashoffset="${-off}" data-tip="${esc(p.name)} · ${money(p.value)} · %${Math.round(p.value / total * 100)}"><title>${esc(p.name)}: ${money(p.value)}</title></circle>`;
+    off += p.value / total * C; return el;
+  }).join('');
+  return `<svg viewBox="0 0 180 180" class="donut" role="img" aria-label="Kategorilere göre gider"><g transform="rotate(-90 90 90)">${segs}</g>
+    <text x="90" y="86" text-anchor="middle" class="dn-k">Toplam gider</text><text x="90" y="106" text-anchor="middle" class="dn-v">${money(total)}</text></svg>`;
+}
+function monthsBarsSVG(months){
+  // months: [{ ym, inc, out }] — gelir ve gider yan yana, tek eksen
+  const W = 320, H = 170, padL = 6, padB = 22, padT = 10, n = months.length, gw = (W - padL) / n, bw = Math.min(16, gw / 2 - 4);
+  const max = Math.max(1, ...months.map(m => Math.max(m.inc, m.out)));
+  const y = v => H - padB - (v / max) * (H - padB - padT);
+  const grid = [0.5, 1].map(f => `<line x1="0" x2="${W}" y1="${y(max * f)}" y2="${y(max * f)}" class="ax-grid"/>`).join('');
+  const bars = months.map((m, i) => {
+    const x = padL + i * gw + gw / 2, [yy, mm] = m.ym.split('-');
+    const b = (v, dx, cls, lbl) => { const top = y(v), h = Math.max(0, H - padB - top); return h ? `<path class="bar ${cls}" d="M${x + dx},${H - padB} v${-(h - 4 > 0 ? h - 4 : 0)} q0,-4 4,-4 h${bw - 8} q4,0 4,4 v${h - 4 > 0 ? h - 4 : 0} z" data-tip="${MONL[+mm - 1]} ${lbl}: ${money(v)}"><title>${MONL[+mm - 1]} ${lbl}: ${money(v)}</title></path>` : ''; };
+    return b(m.inc, -bw - 1, 'b-in', 'gelir') + b(m.out, 1, 'b-out', 'gider') +
+      `<text x="${x}" y="${H - 6}" text-anchor="middle" class="ax-t">${MONL[+mm - 1].slice(0, 3)}</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" class="mbars" role="img" aria-label="Son 6 ay gelir ve gider">${grid}<line x1="0" x2="${W}" y1="${H - padB}" y2="${H - padB}" class="ax-base"/>${bars}</svg>`;
+}
+function dailySVG(days){
+  // days: [{ d, out }] — bu ay günlük gider
+  const W = 320, H = 120, padB = 18, n = days.length, gw = W / n, bw = Math.max(2, gw - 2);
+  const max = Math.max(1, ...days.map(d => d.out)), y = v => H - padB - (v / max) * (H - padB - 6);
+  const bars = days.map((d, i) => { const top = y(d.out), h = H - padB - top;
+    return `<rect class="bar b-day ${d.d === TODAY ? 'today' : ''}" x="${i * gw + 1}" y="${top}" width="${bw}" height="${Math.max(h, d.out ? 2 : 0)}" rx="2" data-tip="${dLabel(d.d)}: ${money(d.out)}"><title>${dLabel(d.d)}: ${money(d.out)}</title></rect>`; }).join('');
+  const ticks = [1, 10, 20, n].map(k => `<text x="${(k - 0.5) * gw}" y="${H - 4}" text-anchor="middle" class="ax-t">${k}</text>`).join('');
+  return `<svg viewBox="0 0 ${W} ${H}" class="dbars" role="img" aria-label="Bu ay günlük gider">${bars}<line x1="0" x2="${W}" y1="${H - padB}" y2="${H - padB}" class="ax-base"/>${ticks}</svg>`;
+}
+function viewWalletSummary(){
+  const A = wAll(), M = A.filter(t => t.date && t.date.slice(0, 7) === walletMonth);
+  const out = M.filter(t => t.kind === 'out'), inc = M.filter(t => t.kind === 'in');
+  const sOut = out.reduce((a, t) => a + t.amount, 0), sIn = inc.reduce((a, t) => a + t.amount, 0);
+  // kategoriler: en büyük 6 + kalanlar "Diğerleri"
+  const byCat = {}; out.forEach(t => { byCat[t.cat || '_'] = (byCat[t.cat || '_'] || 0) + t.amount; });
+  let parts = Object.entries(byCat).sort((a, b) => b[1] - a[1]).map(([c, v]) => ({ name: c === '_' ? 'Kategorisiz' : wCatName('out', c), value: v, color: c === '_' ? '#868e96' : wColor('out', c) }));
+  if (parts.length > 7){ const rest = parts.slice(6).reduce((a, p) => a + p.value, 0); parts = parts.slice(0, 6).concat([{ name: 'Diğerleri', value: rest, color: '#868e96' }]); }
+  const months = []; for (let i = 5; i >= 0; i--){ const ym = shiftMonth(walletMonth, -i), X = A.filter(t => t.date && t.date.slice(0, 7) === ym);
+    months.push({ ym, inc: X.filter(t => t.kind === 'in').reduce((a, t) => a + t.amount, 0), out: X.filter(t => t.kind === 'out').reduce((a, t) => a + t.amount, 0) }); }
+  const dim = new Date(+walletMonth.slice(0, 4), +walletMonth.slice(5, 7), 0).getDate(), days = [];
+  for (let k = 1; k <= dim; k++){ const d = walletMonth + '-' + String(k).padStart(2, '0'); days.push({ d, out: out.filter(t => t.date === d).reduce((a, t) => a + t.amount, 0) }); }
+  const big = out.slice().sort((a, b) => b.amount - a.amount)[0];
+  const rate = sIn ? Math.round((sIn - sOut) / sIn * 100) : null;
+  const prev = months[4], prevOut = prev ? prev.out : 0, diff = prevOut ? Math.round((sOut - prevOut) / prevOut * 100) : null;
+  let h = `<div class="w-tiles">
+      <div class="w-tile"><small>Birikim oranı</small><b class="${rate !== null && rate < 0 ? 'neg' : ''}">${rate === null ? '—' : '%' + rate}</b><span>gelirden kalan</span></div>
+      <div class="w-tile"><small>Geçen aya göre gider</small><b class="${diff > 0 ? 'neg' : diff < 0 ? 'pos' : ''}">${diff === null ? '—' : (diff > 0 ? '↑ %' : diff < 0 ? '↓ %' : '%') + Math.abs(diff)}</b><span>${prevOut ? money(prevOut) + ' idi' : 'karşılaştırma yok'}</span></div>
+      <div class="w-tile"><small>En büyük harcama</small><b>${big ? money(big.amount) : '—'}</b><span>${big ? esc(big.note || wCatName('out', big.cat)) : 'henüz yok'}</span></div>
+    </div>`;
+  h += `<h2><span class="hl"><span class="dot"></span>Kategorilere göre gider</span><span>${monthLabel(walletMonth)}</span></h2>`;
+  h += parts.length ? `<div class="chart-card"><div class="dn-wrap">${donutSVG(parts, sOut)}
+      <ul class="legend">${parts.map(p => `<li data-tip="${esc(p.name)} · ${money(p.value)} · %${Math.round(p.value / sOut * 100)}"><i style="background:${p.color}"></i><span>${esc(p.name)}</span><b>${money(p.value)}</b><small>%${Math.round(p.value / sOut * 100)}</small></li>`).join('')}</ul></div>
+      <div class="tip" aria-live="polite">Bir dilime dokun</div></div>` : `<div class="cal-empty">Bu ay gider yok.</div>`;
+  h += `<h2><span class="hl"><span class="dot"></span>Son 6 ay</span><span class="lg"><i class="b-in"></i>Gelir <i class="b-out"></i>Gider</span></h2>
+    <div class="chart-card">${monthsBarsSVG(months)}<div class="tip" aria-live="polite">Bir çubuğa dokun</div></div>`;
+  h += `<h2><span class="hl"><span class="dot"></span>Günlük gider</span><span>${monthLabel(walletMonth)}</span></h2>
+    <div class="chart-card">${dailySVG(days)}<div class="tip" aria-live="polite">Bir güne dokun</div></div>`;
+  return h;
+}
+// grafiklerde dokunulan/üzerine gelinen değeri göster
+function showTip(e){
+  const m = e.target.closest && e.target.closest('[data-tip]'); if (!m) return;
+  const card = m.closest('.chart-card'); if (!card) return;
+  const tip = card.querySelector('.tip'); if (tip) tip.textContent = m.dataset.tip;
+  card.querySelectorAll('.on').forEach(x => x.classList.remove('on')); m.classList.add('on');
+}
+document.addEventListener('pointerover', showTip);
+document.addEventListener('click', showTip);
 
 /* ---------- Bölümler: Ajanda / Cüzdan ---------- */
 let section = (() => { try { return localStorage.getItem('gundem-section') || 'ajanda'; } catch(e){ return 'ajanda'; } })();
@@ -596,14 +771,14 @@ function renderBanner(){
 function renderAddChips(){
   if (section === 'cuzdan'){
     let h = [['out','Gider'],['in','Gelir']].map(([k,l]) => `<button type="button" class="chip ${k === 'in' ? 'k-in' : 'k-out'}" data-act="wAddKind" data-v="${k}" aria-pressed="${wKind===k}">${l}</button>`).join('');
-    h += Object.entries(W_CATS[wKind]).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:${W_COLORS[k]}" data-act="wAddCat" data-v="${k}" aria-pressed="${wCat===k}">${v}</button>`).join('');
+    h += Object.entries(W_CATS[wKind]).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:${wColor(wKind, k)}" data-act="wAddCat" data-v="${k}" aria-pressed="${wCat===k}">${v}</button>`).join('');
     $('addChips').innerHTML = h; $('q').placeholder = 'Tutar ve ne için… (ör. 560 yemek, 15000 maaş)'; return;
   }
   $('q').placeholder = 'Görev ya da harcama… (ör. faturayı öde yarın, 560 tl yemek)';
   const dates = [[null,'Tarihsiz'],['today','Bugün'],['tomorrow','Yarın']];
   let h = dates.map(([k,l]) => `<button type="button" class="chip" data-add="date" data-v="${k}" aria-pressed="${addDate===k}">${l}</button>`).join('');
   h += `<label class="chip" aria-pressed="${addDate==='custom'}">📅 <input type="date" id="addDateInp" value="${customDate}" aria-label="Tarih seç"></label>`;
-  h += Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:var(--c-${k})" data-add="cat" data-v="${k}" aria-pressed="${addCat===k}">${v}</button>`).join('');
+  h += Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:${tColor(k)}" data-add="cat" data-v="${k}" aria-pressed="${addCat===k}">${v}</button>`).join('');
   $('addChips').innerHTML = h;
 }
 
@@ -616,7 +791,7 @@ function openPicker(){
   s.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Bugünün işlerini seç">
     <h3>Bugün neleri aradan çıkaracaksın?</h3><p class="sub">Dokunarak seç. Tarihi bugün olanlar zaten listede.</p>
     <div class="scroll">${A.map(t => { const on = t.pickedFor === TODAY, m = [];
-      if (t.cat) m.push(`<span class="cat" style="--cc:var(--c-${t.cat})">${CATS[t.cat]}</span>`);
+      if (t.cat) m.push(`<span class="cat" style="--cc:${tColor(t.cat)}">${CATS[t.cat]}</span>`);
       if (t.date) m.push(`<span>${dLabel(t.date)}</span>`);
       if (isLeftover(t)) m.push('<span>Dünden kaldı</span>');
       return `<button class="pick" data-act="pickt" data-id="${t.id}" aria-pressed="${on}"><span class="box">${CHECK}</span><span class="ttl">${esc(t.title)}${m.length?`<span class="meta">${m.join('')}</span>`:''}</span></button>`; }).join('') || '<div class="empty">Seçilecek iş yok.</div>'}</div>
@@ -647,6 +822,7 @@ function openMenu(){
   s.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Menü">
     <h3>Menü</h3><p class="sub">Gündem ${VERSION}${BUILD.build ? ' · sürüm 1.0.' + BUILD.build : ''}${IS_ANDROID ? ' · Android' : IS_DESKTOP ? ' · Windows' : ''}</p>
     <div class="scroll">
+      <button class="menu-item" data-act="cats">Kategoriler<small>Ekle, sil, adını ya da rengini değiştir</small></button>
       <button class="menu-item" data-act="themes">Tema ve renkler<small>${esc(THEMES[themePref.id].name)} · ${({system:'Sistem',light:'Açık',dark:'Koyu'})[themePref.mode]}</small></button>
       ${IS_DESKTOP ? `<button class="menu-item" data-act="updCheck">Güncellemeleri denetle<small id="updStatus">${esc(updText(deskUpd))}</small></button>${deskUpd.state === 'error' ? '<button class="menu-item" data-act="updLog">Güncelleme günlüğünü aç<small>Hata ayrıntıları burada</small></button>' : ''}` : ''}
       <button class="menu-item" data-act="backup">Yedek indir<small>Bütün görevlerini bir dosya olarak kaydeder.</small></button>
@@ -725,6 +901,7 @@ document.addEventListener('click', e => {
   if (voiceClick(act, b)) return;
   if (calClick(act, b)) return;
   if (walletClick(act, b)) return;
+  if (catsClick(act, b)) return;
   switch (act){
     case 'open': openId = openId === id ? null : id; confirmDel = null; render(); break;
     case 'toggle': if (!t) break;
@@ -832,11 +1009,17 @@ const STEM_FIX = { gid: 'git', ed: 'et', yi: 'ye', di: 'de', yiy: 'ye', diy: 'de
 const FILLERS = /^(?:(?:şey|yani|ee+|ıı+|hmm+|tamam|peki|ben|benim|aslında|bir|de|da|hani|şimdi|ayrıca|ondan|onu)\s+)+/;
 const TAILS = /\s+(?:lazım|gerekiyor|gerek|istiyorum|olacak|yapmalıyım|da|de)$/;
 const CAT_WORDS = {
+  sammetry: /sammetry|sametri|instagram|shorts|reels|tiktok/,
   ev:   /çöp|bulaşık|çamaşır|temizl|süpür|yemek|market|alışveriş|fatura|ütü|toz|mutfak|banyo|kira|tamir|yatak|çiçek|sula/,
   okul: /sınav|ders|ödev|vize|final|kitap oku|çalış(?:ma|acağım|mam)|proje teslim|hoca|lab|mikroişlemci|okul|üniversite|kurs/,
-  is:   /toplantı|müşteri|rapor|teklif|mail|e-?posta|sunum|fatura kes|sözleşme|patron|ofis|iş(?:i|e|te)?\b|proje|teslim|tasarım|video|montaj|instagram|shorts|reels/,
+  is:   /fellystar|felistar|toplantı|müşteri|rapor|teklif|mail|e-?posta|sunum|fatura kes|sözleşme|patron|ofis|iş(?:i|e|te)?\b|proje|teslim|tasarım|video|montaj|instagram|shorts|reels/,
 };
-function guessCat(t){ const l = low(t); for (const [k, re] of Object.entries(CAT_WORDS)) if (re.test(l)) return k; return null; }
+function guessCat(t){
+  const l = low(t);
+  for (const c of prefs.taskCats) if (c.name.length > 1 && l.includes(low(c.name))) return c.id;
+  for (const [k, re] of Object.entries(CAT_WORDS)) if (CATS[k] && re.test(l)) return k;
+  return null;
+}
 
 function cleanTask(piece){
   let s = low(piece).replace(/[.!?…]+$/,'').trim();
@@ -854,6 +1037,7 @@ function splitSpeech(text){
   // güçlü ayraçlar: noktalama, "sonra", "ardından", "ayrıca", "bir de", "daha sonra"
   let parts = (' ' + text + ' ').split(/[,;.!?]+|\s(?:ve\s+)?(?:daha\s+)?sonra(?:\s+de|\s+da)?\s|\sardından\s|\sayrıca\s|\sbir\s+de\s|\sartı\s/i);
   // "ve" ile ayır, ama sadece solundaki kısım bir fiille bitiyorsa ("atacağım ve ...")
+  parts = parts.flatMap(p => p.split(/\s(?=(?:gelir|gider)\s+(?:\d|bin\s))/i));
   parts = parts.flatMap(p => p.split(/(?<=(?:acağım|eceğim|acam|ecem|acağız|eceğiz|malıyım|meliyim|lazım|gerekiyor))\s+(?:(?:ve|hem\s+de)\s+)?/i));
   const out = []; let cur = TODAY;
   for (const raw of parts){
@@ -965,12 +1149,12 @@ function openReview(){
         <button class="v-x" data-act="vdel" data-i="${i}" aria-label="Çıkar">×</button></div>
       <textarea rows="1" class="v-title grow" data-i="${i}" aria-label="Açıklama">${esc(it.title)}</textarea>
       <div class="chips">${[['out','Gider'],['in','Gelir']].map(([k,l]) => `<button type="button" class="chip sm" data-act="vkind" data-i="${i}" data-v="${k}" aria-pressed="${it.kind===k}">${l}</button>`).join('')}
-        ${Object.entries(W_CATS[it.kind]).map(([k,v]) => `<button type="button" class="chip sm cat" style="--cc:${W_COLORS[k]}" data-act="vwcat" data-i="${i}" data-v="${k}" aria-pressed="${it.cat===k}">${v}</button>`).join('')}</div>
+        ${Object.entries(W_CATS[it.kind]).map(([k,v]) => `<button type="button" class="chip sm cat" style="--cc:${wColor(it.kind, k)}" data-act="vwcat" data-i="${i}" data-v="${k}" aria-pressed="${it.cat===k}">${v}</button>`).join('')}</div>
     </div>` : `<div class="v-card" style="--d:${i*70}ms">
       <div class="v-top"><textarea rows="1" class="v-title grow" data-i="${i}" aria-label="Görev">${esc(it.title)}</textarea>
         <button class="v-x" data-act="vdel" data-i="${i}" aria-label="Çıkar">×</button></div>
       <div class="chips">${vDateChips(it, i)}</div>
-      <div class="chips">${Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip sm cat" style="--cc:var(--c-${k})" data-act="vcat" data-i="${i}" data-v="${k}" aria-pressed="${it.cat===k}">${v}</button>`).join('')}</div>
+      <div class="chips">${Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip sm cat" style="--cc:${tColor(k)}" data-act="vcat" data-i="${i}" data-v="${k}" aria-pressed="${it.cat===k}">${v}</button>`).join('')}</div>
     </div>`).join('');
   $('sheet').innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Anladıklarım">
     <h3>${voiceItems.length} şey anladım</h3><p class="sub">“${esc(heard)}”</p>
@@ -1011,7 +1195,7 @@ const chipDate = () => addDate === 'today' ? TODAY : addDate === 'tomorrow' ? ad
 // Yazılan cümle görev mi, para mı? Para ise cüzdana gider.
 function moneyFromInput(raw){
   const m = parseMoney(raw, section === 'cuzdan'); if (!m) return null;
-  if (section === 'cuzdan' && !IN_RE.test(low(raw))){ if (m.kind !== wKind){ m.kind = wKind; m.cat = guessWCat(wKind, raw); } }
+  if (section === 'cuzdan' && !m.forced && !IN_RE.test(low(raw))){ if (m.kind !== wKind){ m.kind = wKind; m.cat = guessWCat(wKind, raw); } }
   if (wCat && section === 'cuzdan' && W_CATS[m.kind][wCat]) m.cat = wCat;
   return m;
 }
@@ -1078,6 +1262,7 @@ function showApp(user){
   userId = user.id; sessionEmail = user.email || '';
   tasks.clear(); lsGet(K_CACHE(), []).forEach(t => tasks.set(t.id, t)); outbox = lsGet(K_OUT(), []);
   txns.clear(); lsGet(K_WCACHE(), []).forEach(t => txns.set(t.id, t));
+  setPrefs(lsGet('gundem-prefs-' + userId, DEFAULT_PREFS));
   $('auth').hidden = true; $('app').hidden = false; $('addBar').hidden = false;
   render(); flush().then(reload); startRealtime();
   setTimeout(checkAppUpdate, 2500);

@@ -26,6 +26,9 @@ Depo **açık (public)**: kodu başkaları görebilir, görevlerin Supabase'de �
 ## Cüzdan kurulumu (bir kez)
 Supabase → **SQL Editor** → `supabase/003_cuzdan.sql` içeriğini yapıştır → **Run**. Cüzdan sekmesi bundan sonra çalışır.
 
+## Kategoriler (bir kez)
+Supabase → **SQL Editor** → `supabase/004_ayarlar.sql` → **Run**. Kategorilerin iki cihazda ortak olması için gerekli. Düzenleme: uygulamada **⋯ → Kategoriler**.
+
 ## Güncelleme yapmak
 1. Claude'dan değişikliği iste. Claude bu klasördeki dosyaları düzenler.
 2. GitHub Desktop'u aç. Solda değişen dosyalar görünür. Sol alttaki **Summary** kutusuna kısa bir not yaz (ör. "takvim eklendi") → **Commit to main** → üstte **Push origin**.
@@ -57,3 +60,5 @@ Supabase → **SQL Editor** → `supabase/003_cuzdan.sql` içeriğini yapıştı
 - Depo ileride özel yapılırsa: sadece okuma yetkili fine-grained token oluşturup `UPDATE_TOKEN` secret'ı olarak ekle; kod ikisini de destekliyor.
 - Cüzdan: tablo `wallet` (kind in/out, amount, cat, note, date). Alt kutuya yazılan cümle `parseMoney` ile para içeriyorsa cüzdana, değilse göreve gider. Kategoriler `W_CATS`, anahtar kelimeler `W_WORDS`.
 - Akıcı mod (`html.lite`): Android'de otomatik; bulanık cam ve hareketli ışıklar kapalı.
+- Kategoriler `prefs` tablosunda (tek satır, jsonb `data`: taskCats, wallet.in/out). Varsayılanlar `DEFAULT_PREFS`. Kategori anahtarları (id) değişmez, sadece ad/renk değişir; eski kayıtlar bozulmaz.
+- Alt kutuda/seste ilk kelime "gelir"/"gider" ise tür ve para algılaması zorlanır.
