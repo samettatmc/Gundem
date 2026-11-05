@@ -51,7 +51,7 @@ jobs:
       - run: node scripts/write-build-info.js
       - run: node scripts/copy-web.js
       - run: npx cap add android
-      - run: npx capacitor-assets generate --android --iconBackgroundColor '#141E33' --iconBackgroundColorDark '#141E33' --splashBackgroundColor '#0E131B' --splashBackgroundColorDark '#0E131B'
+      - run: npx capacitor-assets generate --android --iconBackgroundColor '#E64980' --iconBackgroundColorDark '#E64980' --splashBackgroundColor '#0E131B' --splashBackgroundColorDark '#0E131B'
       - run: node scripts/patch-android.js
       - run: npx cap sync android
       - name: APK derle ve imzala

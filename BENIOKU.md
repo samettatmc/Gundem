@@ -29,6 +29,9 @@ Supabase → **SQL Editor** → `supabase/003_cuzdan.sql` içeriğini yapıştı
 ## Kategoriler (bir kez)
 Supabase → **SQL Editor** → `supabase/004_ayarlar.sql` → **Run**. Kategorilerin iki cihazda ortak olması için gerekli. Düzenleme: uygulamada **⋯ → Kategoriler**.
 
+## Hesaplar (bir kez)
+Supabase → **SQL Editor** → `supabase/005_hesaplar.sql` → **Run**. Yemek kartı gibi ayrı hesaplar için gerekli. Düzenleme: **⋯ → Hesaplar ve zarflar**.
+
 ## Güncelleme yapmak
 1. Claude'dan değişikliği iste. Claude bu klasördeki dosyaları düzenler.
 2. GitHub Desktop'u aç. Solda değişen dosyalar görünür. Sol alttaki **Summary** kutusuna kısa bir not yaz (ör. "takvim eklendi") → **Commit to main** → üstte **Push origin**.
@@ -62,3 +65,4 @@ Supabase → **SQL Editor** → `supabase/004_ayarlar.sql` → **Run**. Kategori
 - Akıcı mod (`html.lite`): Android'de otomatik; bulanık cam ve hareketli ışıklar kapalı.
 - Kategoriler `prefs` tablosunda (tek satır, jsonb `data`: taskCats, wallet.in/out). Varsayılanlar `DEFAULT_PREFS`. Kategori anahtarları (id) değişmez, sadece ad/renk değişir; eski kayıtlar bozulmaz.
 - Alt kutuda/seste ilk kelime "gelir"/"gider" ise tür ve para algılaması zorlanır.
+- Hesaplar `prefs.accounts` (gizlenen hesap `active:false`, kayıtları silinmez); `wallet.account` sütunu. Zarflar `prefs.envelopes` (amount, dueDay, startDay, overrides[ym], notes[ym], paid[ym]=txnId). Harcanabilir = Ana hesap bakiyesi − ayrılmış zarflar.

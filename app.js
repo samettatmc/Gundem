@@ -9,7 +9,7 @@
 'use strict';
 
 /* ---------- 1. Sabitler ---------- */
-const VERSION = '3.2.0';
+const VERSION = '3.4.1';
 // Hangi ortamda çalışıyoruz: Android uygulaması, Windows uygulaması ya da tarayıcı
 const BUILD = window.GUNDEM_BUILD || { build: 0, repo: '' };
 const IS_ANDROID = !!(window.Capacitor && window.Capacitor.getPlatform && window.Capacitor.getPlatform() === 'android');
@@ -27,6 +27,11 @@ const DEFAULT_PREFS = {
            { id:'eglence', name:'Eğlence', color:'#eb6834' }, { id:'saglik', name:'Sağlık', color:'#008300' }, { id:'egitim', name:'Eğitim', color:'#3987e5' },
            { id:'abonelik', name:'Abonelik', color:'#d95926' }, { id:'diger', name:'Diğer', color:'#868e96' } ],
   },
+  // Hesaplar: gizlenen hesap silinmez, geçmiş kayıtları durur; sadece arayüzden kalkar.
+  accounts: [ { id:'ana', name:'Ana hesap', active:true }, { id:'yemek', name:'Yemek kartı', active:true } ],
+  // Zarflar: her ay kenara ayrılan para. startDay'den itibaren ayrılır, dueDay'de ödenir (ödeme bir sonraki ayda).
+  envelopes: [ { id:'kira', name:'Kira', amount:15500, dueDay:10, startDay:15, account:'ana', cat:'kira', active:true, since:'2026-11',
+                 overrides:{ '2026-11': 13300 }, notes:{ '2026-11': 'Bu ay 13.300 ödenecek' }, paid:{} } ],
 };
 let prefs = JSON.parse(JSON.stringify(DEFAULT_PREFS));
 const CATS = {};   // id → ad (görevler); prefs'ten doldurulur
@@ -165,9 +170,11 @@ const fromRow = r => ({ id: r.id, title: r.title, date: r.date, cat: r.cat, pick
 const KEYMAP = { pickedFor:'picked_for', doneAt:'done_at', doneTs:'done_ts', createdAt:'created_at' };
 const patchToRow = p => Object.fromEntries(Object.entries(p).map(([k,v]) => [KEYMAP[k] || k, v ?? null]));
 // Cüzdan: uygulamada { id, kind:'in'|'out', amount, cat, note, date, createdAt } ↔ tablo "wallet"
-const wToRow = w => ({ id: w.id, kind: w.kind, amount: +w.amount || 0, cat: w.cat || null, note: w.note || null, date: w.date, created_at: w.createdAt || Date.now() });
-const wFromRow = r => ({ id: r.id, kind: r.kind, amount: +r.amount, cat: r.cat, note: r.note, date: r.date, createdAt: r.created_at });
-const wPatchToRow = p => Object.fromEntries(Object.entries(p).map(([k,v]) => [k === 'createdAt' ? 'created_at' : k, v ?? null]));
+let walletHasAccount = true;   // 005_hesaplar.sql çalıştırılmadıysa "account" sütunu yok
+const wToRow = w => { const r = { id: w.id, kind: w.kind, amount: +w.amount || 0, cat: w.cat || null, note: w.note || null, date: w.date, created_at: w.createdAt || Date.now() };
+  if (walletHasAccount) r.account = w.account || 'ana'; return r; };
+const wFromRow = r => ({ id: r.id, kind: r.kind, amount: +r.amount, cat: r.cat, note: r.note, date: r.date, createdAt: r.created_at, account: r.account || 'ana' });
+const wPatchToRow = p => Object.fromEntries(Object.entries(p).filter(([k]) => walletHasAccount || k !== 'account').map(([k,v]) => [k === 'createdAt' ? 'created_at' : k, v ?? null]));
 // Hangi tabloya: eski kayıtlarda tb yok, onlar görevdir.
 const TBL = { tasks: { map: tasks, name: 'tasks', to: t => toRow(t), patch: patchToRow },
               wallet: { map: txns, name: 'wallet', to: w => wToRow(w), patch: wPatchToRow } };
@@ -210,15 +217,16 @@ function setOnline(v){ if (online !== v){ online = v; renderBanner(); } }
 
 async function reload(){
   if (!sb || !userId) return;
-  const [{ data, error }, w, pr] = await Promise.all([sb.from('tasks').select('*').limit(5000), sb.from('wallet').select('*').limit(10000),
-    sb.from('prefs').select('data').eq('user_id', userId).maybeSingle()]);
+  const [{ data, error }, w, pr, acc] = await Promise.all([sb.from('tasks').select('*').limit(5000), sb.from('wallet').select('*').limit(10000),
+    sb.from('prefs').select('data').eq('user_id', userId).maybeSingle(), sb.from('wallet').select('account').limit(1)]);
+  walletHasAccount = !acc.error;
   if (pr.error) prefsRemote = false;
   else { prefsRemote = true; if (pr.data && pr.data.data) { setPrefs(pr.data.data); lsSet('gundem-prefs-' + userId, prefs); } else savePrefs(); }
   if (error){ setOnline(false); return; }
   setOnline(true);
   tasks.clear(); data.forEach(r => tasks.set(r.id, fromRow(r)));
   walletReady = !w.error;   // tablo henüz kurulmadıysa cüzdan kurulum notu gösterir
-  if (!w.error){ txns.clear(); w.data.forEach(r => txns.set(r.id, wFromRow(r))); }
+  if (!w.error){ txns.clear(); w.data.forEach(r => txns.set(r.id, wFromRow(r))); walletLoaded = true; }
   outbox.forEach(applyLocal);   // henüz gönderilmemiş değişikliklerini kaybetme
   saveCache(); scheduleRender();
 }
@@ -236,12 +244,15 @@ function startRealtime(){
 const addTask = data => queue({ op: 'upsert', task: { id: uuid(), createdAt: Date.now(), done: false, doneAt: null, doneTs: null, pickedFor: null, cat: null, date: null, ...data } });
 const patch = (id, p) => queue({ op: 'update', id, patch: p });
 const removeTask = id => queue({ op: 'delete', id });
-let walletReady = true, prefsRemote = true, prefsT = null;
+let walletReady = true, walletLoaded = false, prefsRemote = true, prefsT = null;
 function normPrefs(d){
   const ok = a => Array.isArray(a) && a.every(c => c && c.id && typeof c.name === 'string');
-  return { taskCats: ok(d && d.taskCats) ? d.taskCats : DEFAULT_PREFS.taskCats,
-           wallet: { in: ok(d && d.wallet && d.wallet.in) ? d.wallet.in : DEFAULT_PREFS.wallet.in,
-                     out: ok(d && d.wallet && d.wallet.out) ? d.wallet.out : DEFAULT_PREFS.wallet.out } };
+  const clone = x => JSON.parse(JSON.stringify(x));
+  return { taskCats: ok(d && d.taskCats) ? d.taskCats : clone(DEFAULT_PREFS.taskCats),
+           wallet: { in: ok(d && d.wallet && d.wallet.in) ? d.wallet.in : clone(DEFAULT_PREFS.wallet.in),
+                     out: ok(d && d.wallet && d.wallet.out) ? d.wallet.out : clone(DEFAULT_PREFS.wallet.out) },
+           accounts: ok(d && d.accounts) ? d.accounts : clone(DEFAULT_PREFS.accounts),
+           envelopes: Array.isArray(d && d.envelopes) ? d.envelopes.map(e => ({ overrides:{}, notes:{}, paid:{}, ...e })) : clone(DEFAULT_PREFS.envelopes) };
 }
 function setPrefs(d){ prefs = normPrefs(d); rebuildCats(); }
 function savePrefs(){
@@ -505,7 +516,7 @@ function parseMoney(text, force){
   return { kind, amount: Math.round(amount * 100) / 100, cat, note, date, forced: !!forcedKind };
 }
 
-let walletMonth = TODAY.slice(0, 7), wOpen = null, wConfirm = null, wKind = 'out', wCat = null;
+let walletMonth = TODAY.slice(0, 7), wOpen = null, wConfirm = null, wKind = 'out', wCat = null, wAddAcc = 'ana';
 const monthLabel = ym => { const [y, m] = ym.split('-').map(Number); return MONL[m - 1] + ' ' + y; };
 const shiftMonth = (ym, n) => { const d = new Date(+ym.slice(0, 4), +ym.slice(5, 7) - 1 + n, 1); return ymd(d).slice(0, 7); };
 const wAll = () => [...txns.values()];
@@ -522,23 +533,151 @@ function txnHTML(t){
       </div>
       <textarea rows="1" class="grow" data-act="wnote" data-id="${t.id}" aria-label="Açıklama">${esc(t.note || '')}</textarea>
       <div class="chips">${cats}</div>
+      ${prefs.accounts.length > 1 ? `<div class="chips">${prefs.accounts.filter(a => a.active !== false || a.id === accOf(t)).map(a => `<button type="button" class="chip sm" data-act="wacct" data-id="${t.id}" data-v="${a.id}" aria-pressed="${accOf(t)===a.id}">${esc(a.name)}</button>`).join('')}</div>` : ''}
       <div class="chips"><label class="chip">📅 <input type="date" data-act="wdate" data-id="${t.id}" value="${t.date}" aria-label="Tarih"></label>
         ${wConfirm === t.id ? `<button class="chip danger" data-act="wdel2" data-id="${t.id}">Evet, sil</button><button class="chip" data-act="wdel0">Vazgeç</button>` : `<button class="chip danger" data-act="wdel1" data-id="${t.id}">Sil</button>`}</div>
     </div>`;
   }
   return `<div class="task txn ${t.kind}"><div class="row">
     <span class="w-ico" style="--cc:${color}">${esc(wCatName(t.kind, t.cat).slice(0, 1))}</span>
-    <button class="body" data-act="wopen" data-id="${t.id}"><div class="ttl">${esc(t.note || wCatName(t.kind, t.cat))}</div><div class="meta"><span class="cat" style="--cc:${color}">${wCatName(t.kind, t.cat)}</span></div></button>
+    <button class="body" data-act="wopen" data-id="${t.id}"><div class="ttl">${esc(t.note || wCatName(t.kind, t.cat))}</div><div class="meta"><span class="cat" style="--cc:${color}">${wCatName(t.kind, t.cat)}</span>${accOf(t) !== 'ana' ? `<span class="acc-tag">${esc(accName(accOf(t)))}</span>` : ''}</div></button>
     <span class="w-amount ${t.kind}">${sign}${money(t.amount)}</span></div>${edit}</div>`;
+}
+
+/* ---------- Hesaplar ve zarflar ---------- */
+const accOf = t => t.account || 'ana';
+const accName = id => ((prefs.accounts.find(a => a.id === id) || {}).name) || 'Hesap';
+const activeAccounts = () => prefs.accounts.filter(a => a.active !== false);
+const accBalance = id => wAll().reduce((a, t) => accOf(t) === id ? a + (t.kind === 'in' ? t.amount : -t.amount) : a, 0);
+let wAcc = 'all', envOpen = null;
+
+const dimOf = ym => new Date(+ym.slice(0, 4), +ym.slice(5, 7), 0).getDate();
+const dayIn = (ym, d) => ym + '-' + String(Math.min(d, dimOf(ym))).padStart(2, '0');
+// Bir zarfın yakın dönemdeki ödemeleri: { env, ym, due, start, amount, paidId, reserved }
+function envInstances(){
+  const cur = TODAY.slice(0, 7), out = [];
+  prefs.envelopes.filter(e => e.active !== false).forEach(e => {
+    [shiftMonth(cur, -1), cur, shiftMonth(cur, 1)].forEach(ym => {
+      if (e.since && ym < e.since) return;
+      const due = dayIn(ym, e.dueDay || 1), start = dayIn(shiftMonth(ym, -1), e.startDay || 1);
+      let paidId = (e.paid || {})[ym]; if (paidId && walletLoaded && !txns.has(paidId) && !outbox.some(o => o.task && o.task.id === paidId)) paidId = null;   // ödeme kaydı silindiyse
+      const amount = (e.overrides || {})[ym] != null ? +e.overrides[ym] : +e.amount;
+      if (paidId && due < addDays(TODAY, -40)) return;
+      out.push({ env: e, ym, due, start, amount, paidId, note: (e.notes || {})[ym] || '', reserved: !paidId && start <= TODAY });
+    });
+  });
+  return out.sort((a, b) => a.due < b.due ? -1 : 1);
+}
+const reservedTotal = acc => envInstances().filter(i => i.reserved && (i.env.account || 'ana') === acc).reduce((a, i) => a + i.amount, 0);
+
+function envCardHTML(i){
+  const e = i.env, n = diffDays(i.due);
+  const when = i.paidId ? 'Ödendi' : n < 0 ? Math.abs(n) + ' gün geçti' : n === 0 ? 'Bugün ödenecek' : n + ' gün kaldı';
+  const state = i.paidId ? 'paid' : n <= 0 ? 'due' : i.reserved ? 'res' : 'soon';
+  let edit = '';
+  if (envOpen === e.id + ':' + i.ym){
+    edit = `<div class="edit">
+      <label class="env-f"><span>Bu seferki tutar (${dLabel(i.due)})</span><input type="text" inputmode="decimal" class="w-amt" data-act="envOnce" data-env="${e.id}" data-ym="${i.ym}" value="${String(i.amount).replace('.', ',')}"></label>
+      <label class="env-f"><span>Not</span><textarea rows="1" class="grow" data-act="envNote" data-env="${e.id}" data-ym="${i.ym}" placeholder="ör. ev sahibi bu ay 300 lira indirim yaptı">${esc(i.note)}</textarea></label>
+      <div class="env-grid">
+        <label class="env-f"><span>Her ayki tutar</span><input type="text" inputmode="decimal" class="w-amt" data-act="envAmt" data-env="${e.id}" value="${String(e.amount).replace('.', ',')}"></label>
+        <label class="env-f"><span>Ödeme günü</span><input type="number" min="1" max="31" class="w-amt" data-act="envDue" data-env="${e.id}" value="${e.dueDay}"></label>
+        <label class="env-f"><span>Ayırma günü (önceki ay)</span><input type="number" min="1" max="31" class="w-amt" data-act="envStart" data-env="${e.id}" value="${e.startDay}"></label>
+      </div>
+      <div class="chips">${i.paidId ? `<button class="chip" data-act="envUnpay" data-env="${e.id}" data-ym="${i.ym}">Ödenmedi olarak işaretle</button>` : ''}
+        <button class="chip danger" data-act="envDel" data-env="${e.id}">Zarfı sil</button></div>
+    </div>`;
+  }
+  return `<div class="task env ${state}"><div class="row">
+      <span class="w-ico env-ico">✉</span>
+      <button class="body" data-act="envOpen" data-env="${e.id}" data-ym="${i.ym}"><div class="ttl">${esc(e.name)} · ${dLabel(i.due)}</div>
+        <div class="meta"><span>${when}</span>${i.amount !== +e.amount ? `<span>her ay ${money(e.amount)}</span>` : ''}${i.note ? `<span>${esc(i.note)}</span>` : ''}</div></button>
+      <span class="w-amount">${money(i.amount)}</span>
+      ${i.paidId ? '' : `<button class="pin ${state === 'due' ? 'on' : ''}" data-act="envPay" data-env="${e.id}" data-ym="${i.ym}">Ödendi</button>`}
+    </div>${edit}</div>`;
+}
+function payEnvelope(envId, ym){
+  const e = prefs.envelopes.find(x => x.id === envId); if (!e) return;
+  const inst = envInstances().find(i => i.env.id === envId && i.ym === ym); if (!inst) return;
+  const id = uuid();
+  queue({ op: 'upsert', tb: 'wallet', task: { id, createdAt: Date.now(), kind: 'out', amount: inst.amount, cat: W_CATS.out[e.cat] ? e.cat : (W_CATS.out.kira ? 'kira' : null), note: e.name + ' (' + MONL[+ym.slice(5, 7) - 1] + ')', date: TODAY, account: e.account || 'ana' } });
+  e.paid = { ...(e.paid || {}), [ym]: id }; savePrefs();
+  toast(e.name + ' ödendi · ' + money(inst.amount), () => { removeTxn(id); delete e.paid[ym]; savePrefs(); });
+}
+const numIn = v => { const n = parseFloat(String(v).replace(/\./g, '').replace(',', '.')); return n > 0 ? Math.round(n * 100) / 100 : null; };
+function envClick(act, b){
+  const e = b.dataset.env && prefs.envelopes.find(x => x.id === b.dataset.env), ym = b.dataset.ym;
+  switch (act){
+    case 'envOpen': { const k = b.dataset.env + ':' + ym; envOpen = envOpen === k ? null : k; render(); return true; }
+    case 'envPay': payEnvelope(b.dataset.env, ym); return true;
+    case 'envUnpay': if (e && e.paid && e.paid[ym]){ const tid = e.paid[ym]; delete e.paid[ym]; if (txns.has(tid)) removeTxn(tid); savePrefs(); toast('Ödeme geri alındı'); } return true;
+    case 'envDel': if (e){ const idx = prefs.envelopes.indexOf(e); prefs.envelopes.splice(idx, 1); envOpen = null; savePrefs(); toast('“' + e.name + '” zarfı silindi', () => { prefs.envelopes.splice(idx, 0, e); savePrefs(); }); } return true;
+    case 'wAcc': wAcc = b.dataset.v; render(); return true;
+    case 'accs': openAccounts(); return true;
+    case 'accToggle': { const a = prefs.accounts[+b.dataset.i]; if (a){ if (a.id === 'ana'){ toast('Ana hesap kapatılamaz'); return true; } a.active = a.active === false; if (wAcc === a.id) wAcc = 'all'; savePrefs(); openAccounts(); toast(a.name + (a.active ? ' gösteriliyor' : ' gizlendi · geçmiş kayıtlar duruyor')); } return true; }
+    case 'envNew': { const id = 'z' + Date.now().toString(36); prefs.envelopes.push({ id, name: 'Yeni zarf', amount: 1000, dueDay: 1, startDay: 15, account: 'ana', cat: null, active: true, since: TODAY.slice(0, 7), overrides: {}, notes: {}, paid: {} }); savePrefs(); closeSheet();
+      const inst = envInstances().find(i => i.env.id === id); envOpen = inst ? id + ':' + inst.ym : null; render(); toast('Zarf eklendi, tutarını ve günlerini düzenle'); return true; }
+  }
+  return false;
+}
+document.addEventListener('change', ev => {
+  const el = ev.target, e = el.dataset && el.dataset.env && prefs.envelopes.find(x => x.id === el.dataset.env); if (!e) return;
+  const a = el.dataset.act;
+  if (a === 'envOnce'){ const v = numIn(el.value); if (!v) return toast('Geçerli bir tutar yaz'); e.overrides = { ...(e.overrides || {}) }; if (v === +e.amount) delete e.overrides[el.dataset.ym]; else e.overrides[el.dataset.ym] = v; }
+  else if (a === 'envAmt'){ const v = numIn(el.value); if (!v) return toast('Geçerli bir tutar yaz'); e.amount = v; }
+  else if (a === 'envDue' || a === 'envStart'){ const d = Math.max(1, Math.min(31, parseInt(el.value, 10) || 1)); e[a === 'envDue' ? 'dueDay' : 'startDay'] = d; }
+  else if (a === 'envNote'){ e.notes = { ...(e.notes || {}) }; if (el.value.trim()) e.notes[el.dataset.ym] = el.value.trim(); else delete e.notes[el.dataset.ym]; }
+  else if (a === 'envName'){ if (el.value.trim()) e.name = el.value.trim(); }
+  else return;
+  savePrefs(); toast('Kaydedildi');
+});
+
+function openAccounts(){
+  sheetKind = 'accs';
+  const rows = prefs.accounts.map((a, i) => `<div class="cat-row ${a.active === false ? 'off' : ''}">
+      <input type="text" class="aname" data-i="${i}" value="${esc(a.name)}" aria-label="Hesap adı" maxlength="24">
+      <span class="acc-bal">${money(accBalance(a.id))}</span>
+      ${a.id === 'ana' ? '' : `<button class="chip sm" data-act="accToggle" data-i="${i}" aria-pressed="${a.active !== false}">${a.active === false ? 'Gizli' : 'Görünüyor'}</button>`}</div>`).join('');
+  const envs = prefs.envelopes.map(e => `<div class="cat-row"><input type="text" class="aname" data-act="envName" data-env="${e.id}" value="${esc(e.name)}" aria-label="Zarf adı" maxlength="24">
+      <span class="acc-bal">${money(e.amount)} · her ayın ${e.dueDay}'i</span></div>`).join('');
+  $('sheet').innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Hesaplar ve zarflar">
+    <h3>Hesaplar ve zarflar</h3>
+    <p class="sub">Gizlediğin hesap silinmez: geçmiş kayıtları Hareketler'de durur, sadece seçeneklerden ve özetten kalkar.${walletHasAccount ? '' : ' <b>Not:</b> hesapların kaydedilmesi için supabase/005_hesaplar.sql çalıştırılmalı.'}</p>
+    <div class="scroll">${rows}
+      <form class="cat-add" id="accAdd"><input type="text" id="accNew" placeholder="Yeni hesap adı (ör. Kredi kartı)" maxlength="24" aria-label="Yeni hesap"><button class="btn" type="submit">Ekle</button></form>
+      <h2>Zarflar</h2>${envs || '<div class="cal-empty">Zarf yok.</div>'}
+      <button class="cta" data-act="envNew"><span class="cta-plus">+</span><span>Yeni zarf<small>Her ay kenara ayrılacak para (kira, aidat …)</small></span></button>
+    </div>
+    <div class="foot"><button class="btn" data-act="closesheet">Tamam</button></div></div>`;
+  $('sheet').hidden = false;
+}
+document.addEventListener('change', ev => {
+  const el = ev.target; if (!el.classList || !el.classList.contains('aname') || el.dataset.env) return;
+  const a = prefs.accounts[+el.dataset.i], v = el.value.trim(); if (a && v && v !== a.name){ a.name = v; savePrefs(); toast('Kaydedildi'); }
+});
+document.addEventListener('submit', ev => {
+  if (ev.target.id !== 'accAdd') return; ev.preventDefault();
+  const v = $('accNew').value.trim(); if (!v) return;
+  prefs.accounts.push({ id: 'h' + Date.now().toString(36), name: v, active: true }); savePrefs(); openAccounts();
+});
+// "yemek kartından 250 öğle yemeği" → Yemek kartı hesabı
+function guessAccount(text){
+  const l = low(text), act = activeAccounts();
+  for (const a of act) if (a.id !== 'ana' && l.includes(low(a.name))) return a.id;
+  if (act.some(a => a.id === 'yemek') && /yemek kart|kartından|kartla|kart ile|multinet|sodexo|pluxee|ticket|setcard|edenred|metropol/.test(l)) return 'yemek';
+  return null;
 }
 
 function viewWallet(){
   if (!walletReady) return emptyHTML('Cüzdan için bir kurulum adımı kaldı', "Supabase'de SQL Editor'e supabase/003_cuzdan.sql dosyasını yapıştırıp Run'a bas. Sonra uygulamayı yeniden aç.");
-  const A = wAll(), M = A.filter(t => t.date && t.date.slice(0, 7) === walletMonth);
+  if (wAcc !== 'all' && !activeAccounts().some(a => a.id === wAcc)) wAcc = 'all';
+  const A = wAll().filter(t => wAcc === 'all' || accOf(t) === wAcc), M = A.filter(t => t.date && t.date.slice(0, 7) === walletMonth);
   const inc = M.filter(t => t.kind === 'in').reduce((a, t) => a + t.amount, 0);
   const out = M.filter(t => t.kind === 'out').reduce((a, t) => a + t.amount, 0);
-  const total = A.reduce((a, t) => a + (t.kind === 'in' ? t.amount : -t.amount), 0);
-  const left = inc - out, pct = inc ? Math.min(100, Math.round(out / inc * 100)) : (out ? 100 : 0);
+  const pct = inc ? Math.min(100, Math.round(out / inc * 100)) : (out ? 100 : 0);
+  const accs = activeAccounts(), reserved = reservedTotal('ana'), anaBal = accBalance('ana'), spendable = anaBal - reserved;
+  const grand = accs.reduce((a, x) => a + accBalance(x.id), 0);
+  const insts = envInstances(), dueNow = insts.filter(i => !i.paidId && i.due <= TODAY);
   const isCur = walletMonth === TODAY.slice(0, 7);
   const daysPassed = isCur ? pd(TODAY).getDate() : new Date(+walletMonth.slice(0, 4), +walletMonth.slice(5, 7), 0).getDate();
   // kategori dağılımı
@@ -550,16 +689,27 @@ function viewWallet(){
       <span class="cal-title">${monthLabel(walletMonth)}</span>
       <button class="nav-btn" data-act="wNext" aria-label="Sonraki ay">›</button>
     </div>
-    <div class="seg w-seg">${[['list','Hareketler'],['ozet','Özet']].map(([k,l]) => `<button class="chip" data-act="wView" data-v="${k}" aria-pressed="${wView===k}">${l}</button>`).join('')}</div>
+    ${dueNow.map(i => `<div class="due-bar"><span><b>${esc(i.env.name)} günü ${i.due < TODAY ? 'geçti' : 'geldi'}</b><small>${money(i.amount)} · ${dLabel(i.due)}${i.note ? ' · ' + esc(i.note) : ''}</small></span><button class="btn glow" data-act="envPay" data-env="${i.env.id}" data-ym="${i.ym}">Ödendi</button></div>`).join('')}
     <div class="w-hero">
-      <small>${isCur ? 'Bu ay kalan' : monthLabel(walletMonth) + ' sonunda kalan'}</small>
-      <b class="w-big ${left < 0 ? 'neg' : ''}">${money(left)}</b>
-      <div class="w-io"><span class="in">↑ Gelir <b>${money(inc)}</b></span><span class="out">↓ Gider <b>${money(out)}</b></span></div>
+      <small>Harcanabilir</small>
+      <b class="w-big ${spendable < 0 ? 'neg' : ''}">${money(spendable)}</b>
+      <div class="w-accs">
+        <span>${esc(accName('ana'))}<b>${money(anaBal)}</b></span>
+        ${reserved ? `<span>Zarfta ayrılan<b>−${money(reserved)}</b></span>` : ''}
+        ${accs.filter(a => a.id !== 'ana').map(a => `<span>${esc(a.name)}<b>${money(accBalance(a.id))}</b></span>`).join('')}
+      </div>
+      <div class="w-total"><span>${isCur ? 'Bu ay' : monthLabel(walletMonth)}${wAcc !== 'all' ? ' · ' + esc(accName(wAcc)) : ''}: ↑ ${money(inc)} · ↓ ${money(out)}</span><span>Toplam varlık <b>${money(grand)}</b></span></div>
       <div class="w-meter" title="Gelirin ne kadarı harcandı"><i style="width:${pct}%"></i></div>
       <div class="w-foot"><span>Gelirinin %${pct}'i harcandı</span><span>Günlük ort. gider ${money(out / Math.max(1, daysPassed))}</span></div>
-      <div class="w-total">Toplam bakiye (tüm zamanlar) <b class="${total < 0 ? 'neg' : ''}">${money(total)}</b></div>
+    </div>
+    <div class="w-filters">
+      <div class="seg">${[['list','Hareketler'],['ozet','Özet']].map(([k,l]) => `<button class="chip" data-act="wView" data-v="${k}" aria-pressed="${wView===k}">${l}</button>`).join('')}</div>
+      ${accs.length > 1 ? `<div class="seg">${[['all','Tümü']].concat(accs.map(a => [a.id, a.name])).map(([k,l]) => `<button class="chip" data-act="wAcc" data-v="${k}" aria-pressed="${wAcc===k}">${esc(l)}</button>`).join('')}</div>` : ''}
     </div>`;
   if (wView === 'ozet') return h + viewWalletSummary();
+  const envShow = insts.filter(i => !i.paidId || i.ym === TODAY.slice(0, 7));
+  if (envShow.length && (wAcc === 'all' || wAcc === 'ana'))
+    h += `<h2><span class="hl"><span class="dot"></span>Zarflar · ayrılan paralar</span><button class="link sm" data-act="accs">Düzenle</button></h2><div class="list">${envShow.map(envCardHTML).join('')}</div>`;
   if (cats.length){
     h += `<h2><span class="hl"><span class="dot"></span>Nereye harcadım</span><span>${money(out)}</span></h2><div class="w-cats">` +
       cats.map(([c, v]) => `<div class="w-cat"><span class="w-cat-n"><span class="cat" style="--cc:${wColor('out', c)}">${wCatName('out', c)}</span></span>
@@ -585,6 +735,8 @@ function walletClick(act, b){
     case 'wopen': wOpen = wOpen === id ? null : id; wConfirm = null; render(); return true;
     case 'wkind': if (t && t.kind !== b.dataset.v){ patchTxn(id, { kind: b.dataset.v, cat: guessWCat(b.dataset.v, t.note || '') }); } return true;
     case 'wcat': if (t) patchTxn(id, { cat: b.dataset.v }); return true;
+    case 'wacct': if (t){ if (!walletHasAccount){ toast('Önce supabase/005_hesaplar.sql çalıştırılmalı'); return true; } patchTxn(id, { account: b.dataset.v }); } return true;
+    case 'wAddAcc': wAddAcc = b.dataset.v; renderAddChips(); updateHint(); $('q').focus(); return true;
     case 'wdel1': wConfirm = id; render(); return true;
     case 'wdel0': wConfirm = null; render(); return true;
     case 'wdel2': if (t){ const copy = { ...t }; wOpen = wConfirm = null; removeTxn(id); toast('Silindi', () => queue({ op: 'upsert', tb: 'wallet', task: copy })); } return true;
@@ -683,7 +835,7 @@ function dailySVG(days){
   return `<svg viewBox="0 0 ${W} ${H}" class="dbars" role="img" aria-label="Bu ay günlük gider">${bars}<line x1="0" x2="${W}" y1="${H - padB}" y2="${H - padB}" class="ax-base"/>${ticks}</svg>`;
 }
 function viewWalletSummary(){
-  const A = wAll(), M = A.filter(t => t.date && t.date.slice(0, 7) === walletMonth);
+  const A = wAll().filter(t => wAcc === 'all' || accOf(t) === wAcc), M = A.filter(t => t.date && t.date.slice(0, 7) === walletMonth);
   const out = M.filter(t => t.kind === 'out'), inc = M.filter(t => t.kind === 'in');
   const sOut = out.reduce((a, t) => a + t.amount, 0), sIn = inc.reduce((a, t) => a + t.amount, 0);
   // kategoriler: en büyük 6 + kalanlar "Diğerleri"
@@ -771,6 +923,8 @@ function renderBanner(){
 function renderAddChips(){
   if (section === 'cuzdan'){
     let h = [['out','Gider'],['in','Gelir']].map(([k,l]) => `<button type="button" class="chip ${k === 'in' ? 'k-in' : 'k-out'}" data-act="wAddKind" data-v="${k}" aria-pressed="${wKind===k}">${l}</button>`).join('');
+    const accs = activeAccounts(); if (!accs.some(a => a.id === wAddAcc)) wAddAcc = 'ana';
+    if (accs.length > 1) h += '<span class="chip-sep"></span>' + accs.map(a => `<button type="button" class="chip acc" data-act="wAddAcc" data-v="${a.id}" aria-pressed="${wAddAcc===a.id}">${esc(a.name)}</button>`).join('') + '<span class="chip-sep"></span>';
     h += Object.entries(W_CATS[wKind]).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:${wColor(wKind, k)}" data-act="wAddCat" data-v="${k}" aria-pressed="${wCat===k}">${v}</button>`).join('');
     $('addChips').innerHTML = h; $('q').placeholder = 'Tutar ve ne için… (ör. 560 yemek, 15000 maaş)'; return;
   }
@@ -822,6 +976,7 @@ function openMenu(){
   s.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Menü">
     <h3>Menü</h3><p class="sub">Gündem ${VERSION}${BUILD.build ? ' · sürüm 1.0.' + BUILD.build : ''}${IS_ANDROID ? ' · Android' : IS_DESKTOP ? ' · Windows' : ''}</p>
     <div class="scroll">
+      <button class="menu-item" data-act="accs">Hesaplar ve zarflar<small>Yemek kartı, kira zarfı; gizle ya da ekle</small></button>
       <button class="menu-item" data-act="cats">Kategoriler<small>Ekle, sil, adını ya da rengini değiştir</small></button>
       <button class="menu-item" data-act="themes">Tema ve renkler<small>${esc(THEMES[themePref.id].name)} · ${({system:'Sistem',light:'Açık',dark:'Koyu'})[themePref.mode]}</small></button>
       ${IS_DESKTOP ? `<button class="menu-item" data-act="updCheck">Güncellemeleri denetle<small id="updStatus">${esc(updText(deskUpd))}</small></button>${deskUpd.state === 'error' ? '<button class="menu-item" data-act="updLog">Güncelleme günlüğünü aç<small>Hata ayrıntıları burada</small></button>' : ''}` : ''}
@@ -901,6 +1056,7 @@ document.addEventListener('click', e => {
   if (voiceClick(act, b)) return;
   if (calClick(act, b)) return;
   if (walletClick(act, b)) return;
+  if (envClick(act, b)) return;
   if (catsClick(act, b)) return;
   switch (act){
     case 'open': openId = openId === id ? null : id; confirmDel = null; render(); break;
@@ -1045,7 +1201,7 @@ function splitSpeech(text){
     const p = parseQuick(raw.trim());
     if (p.date) cur = p.date;
     const mny = parseMoney(raw.trim(), false);
-    if (mny){ out.push({ money: true, ...mny, title: mny.note }); continue; }
+    if (mny){ out.push({ money: true, ...mny, title: mny.note, raw }); continue; }
     const title = cleanTask(p.title);
     if (title.length < 2 || /^(?:şey|yani|tamam|peki|hmm+|ee+|ıı+|evet|hayır)$/i.test(title)) continue;
     out.push({ title, date: cur, cat: guessCat(title) });
@@ -1178,7 +1334,7 @@ function voiceClick(act, b){
       let nt = 0, nm = 0;
       voiceItems.forEach(it => {
         const ttl = (it.title || '').trim();
-        if (it.money){ addTxn({ kind: it.kind, amount: it.amount, cat: it.cat, note: ttl || null, date: it.date }); nm++; }
+        if (it.money){ addTxn({ kind: it.kind, amount: it.amount, cat: it.cat, note: ttl || null, date: it.date, account: (walletHasAccount && guessAccount(it.title + ' ' + (it.raw || ''))) || 'ana' }); nm++; }
         else if (ttl){ addTask({ title: ttl, date: it.date, cat: it.cat }); nt++; }
       });
       voiceItems = []; closeSheet(); toast([nt ? nt + ' iş' : '', nm ? nm + ' cüzdan kaydı' : ''].filter(Boolean).join(' ve ') + ' eklendi'); return true; }
@@ -1197,11 +1353,13 @@ function moneyFromInput(raw){
   const m = parseMoney(raw, section === 'cuzdan'); if (!m) return null;
   if (section === 'cuzdan' && !m.forced && !IN_RE.test(low(raw))){ if (m.kind !== wKind){ m.kind = wKind; m.cat = guessWCat(wKind, raw); } }
   if (wCat && section === 'cuzdan' && W_CATS[m.kind][wCat]) m.cat = wCat;
+  m.account = guessAccount(raw) || (section === 'cuzdan' ? wAddAcc : 'ana');
+  if (m.account !== 'ana' && !walletHasAccount) m.account = 'ana';
   return m;
 }
 function updateHint(){
   const h = $('hint'), raw = q.value.trim(), mny = raw && moneyFromInput(raw);
-  if (mny){ h.textContent = `→ Cüzdan · ${mny.kind === 'in' ? 'Gelir' : 'Gider'} ${money(mny.amount)} · ${wCatName(mny.kind, mny.cat)}${mny.date !== TODAY ? ' · ' + dLabel(mny.date) : ''}`; h.hidden = false; return; }
+  if (mny){ h.textContent = `→ ${mny.account !== 'ana' ? accName(mny.account) : 'Cüzdan'} · ${mny.kind === 'in' ? 'Gelir' : 'Gider'} ${money(mny.amount)} · ${wCatName(mny.kind, mny.cat)}${mny.date !== TODAY ? ' · ' + dLabel(mny.date) : ''}`; h.hidden = false; return; }
   if (section === 'cuzdan'){ if (raw){ h.textContent = '→ Tutarı da yaz, ör. 560 yemek'; h.hidden = false; } else h.hidden = true; return; }
   const p = parseQuick(q.value), d = p.date || chipDate();
   if (q.value.trim() && d){ h.textContent = '→ ' + dLabel(d) + (d <= TODAY ? ' · bugünün listesine girer' : ' · o sabah otomatik seçilir'); h.hidden = false; } else h.hidden = true;
