@@ -23,6 +23,9 @@ Depo **açık (public)**: kodu başkaları görebilir, görevlerin Supabase'de �
 
 İleride depo özel yapılmak istenirse: `supabase/002_surumler.sql` çalıştırılır, `SUPABASE_SERVICE_KEY` ve `UPDATE_TOKEN` secret'ları eklenir; kod iki modu da destekliyor.
 
+## Cüzdan kurulumu (bir kez)
+Supabase → **SQL Editor** → `supabase/003_cuzdan.sql` içeriğini yapıştır → **Run**. Cüzdan sekmesi bundan sonra çalışır.
+
 ## Güncelleme yapmak
 1. Claude'dan değişikliği iste. Claude bu klasördeki dosyaları düzenler.
 2. GitHub Desktop'u aç. Solda değişen dosyalar görünür. Sol alttaki **Summary** kutusuna kısa bir not yaz (ör. "takvim eklendi") → **Commit to main** → üstte **Push origin**.
@@ -52,3 +55,5 @@ Depo **açık (public)**: kodu başkaları görebilir, görevlerin Supabase'de �
 - Gün sabah 07:00'de değişir (`DAY_START_HOUR`).
 
 - Depo ileride özel yapılırsa: sadece okuma yetkili fine-grained token oluşturup `UPDATE_TOKEN` secret'ı olarak ekle; kod ikisini de destekliyor.
+- Cüzdan: tablo `wallet` (kind in/out, amount, cat, note, date). Alt kutuya yazılan cümle `parseMoney` ile para içeriyorsa cüzdana, değilse göreve gider. Kategoriler `W_CATS`, anahtar kelimeler `W_WORDS`.
+- Akıcı mod (`html.lite`): Android'de otomatik; bulanık cam ve hareketli ışıklar kapalı.

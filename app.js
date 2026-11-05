@@ -9,7 +9,7 @@
 'use strict';
 
 /* ---------- 1. Sabitler ---------- */
-const VERSION = '3.0.1';
+const VERSION = '3.1.0';
 // Hangi ortamda çalışıyoruz: Android uygulaması, Windows uygulaması ya da tarayıcı
 const BUILD = window.GUNDEM_BUILD || { build: 0, repo: '' };
 const IS_ANDROID = !!(window.Capacitor && window.Capacitor.getPlatform && window.Capacitor.getPlatform() === 'android');
@@ -124,13 +124,21 @@ function setTheme(p){ themePref = { ...themePref, ...p }; try { localStorage.set
 mq.addEventListener ? mq.addEventListener('change', applyTheme) : mq.addListener(applyTheme);
 applyTheme();
 
+// Akıcı mod: bulanık cam ve hareketli ışıkları kapatır, eski telefonlarda donmayı önler.
+let litePref = (() => { try { return localStorage.getItem('gundem-lite') || 'auto'; } catch(e){ return 'auto'; } })();
+const liteAuto = () => /Android/i.test(navigator.userAgent) || (navigator.hardwareConcurrency || 8) <= 4;
+function applyLite(){ document.documentElement.classList.toggle('lite', litePref === 'on' || (litePref === 'auto' && liteAuto())); }
+function setLite(v){ litePref = v; try { localStorage.setItem('gundem-lite', v); } catch(e){} applyLite(); }
+applyLite();
+
 const CFG = window.GUNDEM_CONFIG || {};
 const configured = CFG.SUPABASE_URL && !/BURAYA/.test(CFG.SUPABASE_URL) && CFG.SUPABASE_ANON_KEY && !/BURAYA/.test(CFG.SUPABASE_ANON_KEY);
 const sb = configured ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY, { auth: { persistSession: true, autoRefreshToken: true } }) : null;
 
 const tasks = new Map();
+const txns = new Map();   // cüzdan hareketleri
 let userId = null;
-const K_CACHE = () => 'gundem-cache-' + userId, K_OUT = () => 'gundem-outbox-' + userId;
+const K_CACHE = () => 'gundem-cache-' + userId, K_OUT = () => 'gundem-outbox-' + userId, K_WCACHE = () => 'gundem-wcache-' + userId;
 const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch(e){ return d; } };
 const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch(e){} };
 
@@ -140,15 +148,27 @@ const fromRow = r => ({ id: r.id, title: r.title, date: r.date, cat: r.cat, pick
   done: r.done, doneAt: r.done_at, doneTs: r.done_ts, createdAt: r.created_at });
 const KEYMAP = { pickedFor:'picked_for', doneAt:'done_at', doneTs:'done_ts', createdAt:'created_at' };
 const patchToRow = p => Object.fromEntries(Object.entries(p).map(([k,v]) => [KEYMAP[k] || k, v ?? null]));
+// Cüzdan: uygulamada { id, kind:'in'|'out', amount, cat, note, date, createdAt } ↔ tablo "wallet"
+const wToRow = w => ({ id: w.id, kind: w.kind, amount: +w.amount || 0, cat: w.cat || null, note: w.note || null, date: w.date, created_at: w.createdAt || Date.now() });
+const wFromRow = r => ({ id: r.id, kind: r.kind, amount: +r.amount, cat: r.cat, note: r.note, date: r.date, createdAt: r.created_at });
+const wPatchToRow = p => Object.fromEntries(Object.entries(p).map(([k,v]) => [k === 'createdAt' ? 'created_at' : k, v ?? null]));
+// Hangi tabloya: eski kayıtlarda tb yok, onlar görevdir.
+const TBL = { tasks: { map: tasks, name: 'tasks', to: t => toRow(t), patch: patchToRow },
+              wallet: { map: txns, name: 'wallet', to: w => wToRow(w), patch: wPatchToRow } };
+const tblOf = op => TBL[op.tb || 'tasks'];
 
 let outbox = [];
-function saveCache(){ lsSet(K_CACHE(), [...tasks.values()]); lsSet(K_OUT(), outbox); }
+function saveCache(){ lsSet(K_CACHE(), [...tasks.values()]); lsSet(K_WCACHE(), [...txns.values()]); lsSet(K_OUT(), outbox); }
 function applyLocal(op){
-  if (op.op === 'upsert') tasks.set(op.task.id, { ...op.task });
-  else if (op.op === 'update' && tasks.has(op.id)) tasks.set(op.id, { ...tasks.get(op.id), ...op.patch });
-  else if (op.op === 'delete') tasks.delete(op.id);
+  const m = tblOf(op).map;
+  if (op.op === 'upsert') m.set(op.task.id, { ...op.task });
+  else if (op.op === 'update' && m.has(op.id)) m.set(op.id, { ...m.get(op.id), ...op.patch });
+  else if (op.op === 'delete') m.delete(op.id);
 }
-function queue(op){ applyLocal(op); outbox.push(op); saveCache(); render(); flush(); }
+// Ekranı bir sonraki karede bir kez çiz: art arda değişiklikte telefon donmasın.
+let renderQueued = false;
+function scheduleRender(){ if (renderQueued) return; renderQueued = true; requestAnimationFrame(() => { renderQueued = false; render(); }); }
+function queue(op){ applyLocal(op); outbox.push(op); saveCache(); scheduleRender(); flush(); }
 
 let flushing = false, online = navigator.onLine;
 async function flush(){
@@ -156,10 +176,10 @@ async function flush(){
   flushing = true;
   try{
     while (outbox.length){
-      const op = outbox[0]; let res;
-      if (op.op === 'upsert') res = await sb.from('tasks').upsert(toRow(op.task));
-      else if (op.op === 'update') res = await sb.from('tasks').update(patchToRow(op.patch)).eq('id', op.id);
-      else res = await sb.from('tasks').delete().eq('id', op.id);
+      const op = outbox[0], T = tblOf(op); let res;
+      if (op.op === 'upsert') res = await sb.from(T.name).upsert(T.to(op.task));
+      else if (op.op === 'update') res = await sb.from(T.name).update(T.patch(op.patch)).eq('id', op.id);
+      else res = await sb.from(T.name).delete().eq('id', op.id);
       if (res.error){
         if (isNetErr(res.error)) { setOnline(false); break; }
         console.warn('Gündem: değişiklik reddedildi', res.error); toast('Bir değişiklik kaydedilemedi: ' + res.error.message);
@@ -174,12 +194,14 @@ function setOnline(v){ if (online !== v){ online = v; renderBanner(); } }
 
 async function reload(){
   if (!sb || !userId) return;
-  const { data, error } = await sb.from('tasks').select('*').limit(5000);
+  const [{ data, error }, w] = await Promise.all([sb.from('tasks').select('*').limit(5000), sb.from('wallet').select('*').limit(10000)]);
   if (error){ setOnline(false); return; }
   setOnline(true);
   tasks.clear(); data.forEach(r => tasks.set(r.id, fromRow(r)));
+  walletReady = !w.error;   // tablo henüz kurulmadıysa cüzdan kurulum notu gösterir
+  if (!w.error){ txns.clear(); w.data.forEach(r => txns.set(r.id, wFromRow(r))); }
   outbox.forEach(applyLocal);   // henüz gönderilmemiş değişikliklerini kaybetme
-  saveCache(); render(); refreshSheet();
+  saveCache(); scheduleRender();
 }
 let reloadT;
 const reloadSoon = () => { clearTimeout(reloadT); reloadT = setTimeout(reload, 400); };
@@ -187,12 +209,17 @@ const reloadSoon = () => { clearTimeout(reloadT); reloadT = setTimeout(reload, 4
 function startRealtime(){
   sb.channel('tasks-' + userId)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, () => { if (!outbox.length) reloadSoon(); })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'wallet' }, () => { if (!outbox.length) reloadSoon(); })
     .subscribe();
 }
 
 const addTask = data => queue({ op: 'upsert', task: { id: uuid(), createdAt: Date.now(), done: false, doneAt: null, doneTs: null, pickedFor: null, cat: null, date: null, ...data } });
 const patch = (id, p) => queue({ op: 'update', id, patch: p });
 const removeTask = id => queue({ op: 'delete', id });
+let walletReady = true;
+const addTxn = data => queue({ op: 'upsert', tb: 'wallet', task: { id: uuid(), createdAt: Date.now(), date: TODAY, cat: null, note: null, ...data } });
+const patchTxn = (id, p) => queue({ op: 'update', tb: 'wallet', id, patch: p });
+const removeTxn = id => queue({ op: 'delete', tb: 'wallet', id });
 
 /* ---------- 4. Ekranlar ---------- */
 const all = () => [...tasks.values()];
@@ -225,7 +252,7 @@ function taskHTML(t, ctx){
   if (openId === t.id){
     const cats = Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:var(--c-${k})" data-act="cat" data-id="${t.id}" data-v="${k}" aria-pressed="${t.cat===k}">${v}</button>`).join('');
     edit = `<div class="edit">
-      <input type="text" id="ed-${t.id}" value="${esc(t.title)}" data-act="rename" data-id="${t.id}" aria-label="Görev adı">
+      <textarea rows="1" class="grow" id="ed-${t.id}" data-act="rename" data-id="${t.id}" aria-label="Görev adı">${esc(t.title)}</textarea>
       <div class="chips">
         ${!t.done ? (today ? `<button class="chip" data-act="unpin" data-id="${t.id}">Bugünden çıkar</button>` : `<button class="chip" data-act="pin" data-id="${t.id}">Bugüne al</button>`) : ''}
         ${!t.done ? `<button class="chip" data-act="tomorrow" data-id="${t.id}">Yarına at</button>` : ''}
@@ -368,6 +395,162 @@ function viewDone(){
   return h;
 }
 
+/* ---------- Cüzdan ----------
+ * Gelir / gider kaydı, aylık özet ve kategori dağılımı. Veriler Supabase "wallet" tablosunda.
+ */
+const W_CATS = {
+  out: { yemek:'Yemek', market:'Market', ulasim:'Ulaşım', fatura:'Fatura', kira:'Kira', alisveris:'Alışveriş', eglence:'Eğlence', saglik:'Sağlık', egitim:'Eğitim', abonelik:'Abonelik', diger:'Diğer' },
+  in:  { maas:'Maaş', harclik:'Harçlık', burs:'Burs', satis:'Satış', serbest:'Serbest iş', hediye:'Hediye', diger:'Diğer' },
+};
+const W_COLORS = { yemek:'#F59F00', market:'#37B24D', ulasim:'#1C7ED6', fatura:'#F03E3E', kira:'#AE3EC9', alisveris:'#E64980', eglence:'#7048E8', saglik:'#0CA678', egitim:'#4263EB', abonelik:'#D9480F', diger:'#868E96',
+  maas:'#2F9E44', harclik:'#40C057', burs:'#12B886', satis:'#82C91E', serbest:'#15AABF', hediye:'#FAB005' };
+const W_WORDS = {
+  out: [['yemek', /yemek|yedim|kahvaltı|öğle|akşam yemeği|restoran|kafe|kahve|döner|pizza|burger|lahmacun|çay|içtim|yemeğe/],
+        ['market', /market|bakkal|manav|migros|a101|bim|şok|carrefour|gıda|ekmek|süt/],
+        ['ulasim', /benzin|mazot|akaryakıt|otobüs|metro|taksi|dolmuş|uber|bilet|ulaşım|istanbulkart|otopark|köprü/],
+        ['fatura', /fatura|elektrik|doğalgaz|su faturası|internet|telefon faturası|aidat/],
+        ['kira', /kira/],
+        ['abonelik', /abonelik|netflix|spotify|youtube|icloud|disney|exxen|premium/],
+        ['alisveris', /kıyafet|ayakkabı|pantolon|tişört|mont|elbise|alışveriş|trendyol|hepsiburada|amazon|klavye|mouse|kulaklık|telefon aldım|aldım/],
+        ['eglence', /sinema|konser|oyun|steam|eğlence|bar|parti|maç/],
+        ['saglik', /eczane|ilaç|doktor|hastane|diş|sağlık/],
+        ['egitim', /kitap|kurs|okul|ders|eğitim|kırtasiye|fotokopi/]],
+  in:  [['maas', /maaş/], ['harclik', /harçlık/], ['burs', /burs/], ['satis', /sattım|satış|satıldı/], ['serbest', /proje parası|serbest|freelance|iş parası|ödeme aldım/], ['hediye', /hediye|bayram/]],
+};
+const money = n => { n = Math.round((n || 0) * 100) / 100; const f = n % 1 ? 2 : 0; return new Intl.NumberFormat('tr-TR', { style: 'currency', currency: 'TRY', minimumFractionDigits: f, maximumFractionDigits: f }).format(n); };
+const wCatName = (kind, c) => (W_CATS[kind] && W_CATS[kind][c]) || 'Diğer';
+function guessWCat(kind, text){ const l = low(text); for (const [k, re] of W_WORDS[kind]) if (re.test(l)) return k; return 'diger'; }
+
+/* Yazılan cümlede para var mı? "560 liraya yemek yedim", "15 bin maaş geldi", "dün markete 340,50 tl"
+ * force: cüzdan sayfasındayken "lira" yazmasan da sayı yeterli. */
+const IN_RE = /maaş|harçlık|burs|kazandım|gelir|yattı|yatırıldı|geldi|sattım|satış|prim|ikramiye|iade|hediye geldi|ödeme aldım|aldım parayı/;
+const MONEY_VERB = /harcadım|ödedim|verdim|yedim|içtim|kazandım|yattı|yatırıldı|maaş|harçlık|burs|ödeme|fatura|kira/;
+function parseMoney(text, force){
+  const L = ' ' + low(text) + ' ';
+  const numRe = /(\d{1,3}(?:\.\d{3})+|\d+)(?:,(\d{1,2}))?(\s*bin)?(\s*(?:₺|tl|lira|liralık|liraya|lirayı|liram|tl'ye|tl'lik)\b|\s*₺)?/g;
+  let best = null, m;
+  while ((m = numRe.exec(L))){
+    const after = L.slice(m.index + m[0].length, m.index + m[0].length + 12);
+    if (/^\s*(ocak|şubat|mart|nisan|mayıs|haziran|temmuz|ağustos|eylül|ekim|kasım|aralık|gün|hafta|saat|dakika|ay\b|yıl|kişi|tane|adet)/.test(after)) continue;
+    const cand = { m, cur: !!m[4] };
+    if (!best || (cand.cur && !best.cur)) best = cand;
+  }
+  if (!best) return null;
+  if (!best.cur && !force && !MONEY_VERB.test(L)) return null;
+  const mm = best.m;
+  let amount = parseFloat(mm[1].replace(/\./g, '') + (mm[2] ? '.' + mm[2] : ''));
+  if (mm[3]) amount *= 1000;
+  if (!amount) return null;
+  const kind = IN_RE.test(L) ? 'in' : 'out';
+  // tarih: bugün/dün/yarın/gün adı; para için gün adı geçmiş günü anlatır
+  let rest = (L.slice(0, mm.index) + ' ' + L.slice(mm.index + mm[0].length)).replace(/\s+/g, ' ');
+  let date = TODAY;
+  if (/\s(dün|dünkü)\s/.test(' ' + rest + ' ')){ date = addDays(TODAY, -1); rest = rest.replace(/\bdün(kü)?\b/, ' '); }
+  else if (/\sevvelsi\s?gün\s/.test(' ' + rest + ' ')){ date = addDays(TODAY, -2); rest = rest.replace(/evvelsi\s?gün/, ' '); }
+  else { const q = parseQuick(rest.trim()); if (q.date){ date = q.date; rest = q.title; if (date > TODAY && diffDays(date) < 7 && !/yarın|haftaya|sonra/.test(L)) date = addDays(date, -7); } }
+  const cat = guessWCat(kind, L);
+  let note = (' ' + rest + ' ').replace(/(?<=\s)(harcadım|ödedim|ödendi|verdim|yedim|içtim|kazandım|geldi|yattı|yatırıldı|aldım|için|lira|tl|bugün|gider|gelir|olarak|bir|tane)(?=\s)/g, ' ')
+                 .replace(/\s+/g, ' ').trim();
+  note = note ? note[0].toLocaleUpperCase('tr') + note.slice(1) : wCatName(kind, cat);
+  return { kind, amount: Math.round(amount * 100) / 100, cat, note, date };
+}
+
+let walletMonth = TODAY.slice(0, 7), wOpen = null, wConfirm = null, wKind = 'out', wCat = null;
+const monthLabel = ym => { const [y, m] = ym.split('-').map(Number); return MONL[m - 1] + ' ' + y; };
+const shiftMonth = (ym, n) => { const d = new Date(+ym.slice(0, 4), +ym.slice(5, 7) - 1 + n, 1); return ymd(d).slice(0, 7); };
+const wAll = () => [...txns.values()];
+
+function txnHTML(t){
+  const color = W_COLORS[t.cat] || W_COLORS.diger, sign = t.kind === 'in' ? '+' : '−';
+  let edit = '';
+  if (wOpen === t.id){
+    const cats = Object.entries(W_CATS[t.kind]).map(([k, v]) => `<button type="button" class="chip sm cat" style="--cc:${W_COLORS[k]}" data-act="wcat" data-id="${t.id}" data-v="${k}" aria-pressed="${t.cat===k}">${v}</button>`).join('');
+    edit = `<div class="edit">
+      <div class="w-edit-row">
+        <input type="text" inputmode="decimal" class="w-amt" data-act="wamount" data-id="${t.id}" value="${String(t.amount).replace('.', ',')}" aria-label="Tutar">
+        <div class="seg"><button class="chip ${''}" data-act="wkind" data-id="${t.id}" data-v="out" aria-pressed="${t.kind==='out'}">Gider</button><button class="chip" data-act="wkind" data-id="${t.id}" data-v="in" aria-pressed="${t.kind==='in'}">Gelir</button></div>
+      </div>
+      <textarea rows="1" class="grow" data-act="wnote" data-id="${t.id}" aria-label="Açıklama">${esc(t.note || '')}</textarea>
+      <div class="chips">${cats}</div>
+      <div class="chips"><label class="chip">📅 <input type="date" data-act="wdate" data-id="${t.id}" value="${t.date}" aria-label="Tarih"></label>
+        ${wConfirm === t.id ? `<button class="chip danger" data-act="wdel2" data-id="${t.id}">Evet, sil</button><button class="chip" data-act="wdel0">Vazgeç</button>` : `<button class="chip danger" data-act="wdel1" data-id="${t.id}">Sil</button>`}</div>
+    </div>`;
+  }
+  return `<div class="task txn ${t.kind}"><div class="row">
+    <span class="w-ico" style="--cc:${color}">${esc(wCatName(t.kind, t.cat).slice(0, 1))}</span>
+    <button class="body" data-act="wopen" data-id="${t.id}"><div class="ttl">${esc(t.note || wCatName(t.kind, t.cat))}</div><div class="meta"><span class="cat" style="--cc:${color}">${wCatName(t.kind, t.cat)}</span></div></button>
+    <span class="w-amount ${t.kind}">${sign}${money(t.amount)}</span></div>${edit}</div>`;
+}
+
+function viewWallet(){
+  if (!walletReady) return emptyHTML('Cüzdan için bir kurulum adımı kaldı', "Supabase'de SQL Editor'e supabase/003_cuzdan.sql dosyasını yapıştırıp Run'a bas. Sonra uygulamayı yeniden aç.");
+  const A = wAll(), M = A.filter(t => t.date && t.date.slice(0, 7) === walletMonth);
+  const inc = M.filter(t => t.kind === 'in').reduce((a, t) => a + t.amount, 0);
+  const out = M.filter(t => t.kind === 'out').reduce((a, t) => a + t.amount, 0);
+  const total = A.reduce((a, t) => a + (t.kind === 'in' ? t.amount : -t.amount), 0);
+  const left = inc - out, pct = inc ? Math.min(100, Math.round(out / inc * 100)) : (out ? 100 : 0);
+  const isCur = walletMonth === TODAY.slice(0, 7);
+  const daysPassed = isCur ? pd(TODAY).getDate() : new Date(+walletMonth.slice(0, 4), +walletMonth.slice(5, 7), 0).getDate();
+  // kategori dağılımı
+  const byCat = {}; M.filter(t => t.kind === 'out').forEach(t => { byCat[t.cat || 'diger'] = (byCat[t.cat || 'diger'] || 0) + t.amount; });
+  const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  const maxC = cats.length ? cats[0][1] : 1;
+  let h = `<div class="w-month">
+      <button class="nav-btn" data-act="wPrev" aria-label="Önceki ay">‹</button>
+      <span class="cal-title">${monthLabel(walletMonth)}</span>
+      <button class="nav-btn" data-act="wNext" aria-label="Sonraki ay">›</button>
+    </div>
+    <div class="w-hero">
+      <small>${isCur ? 'Bu ay kalan' : monthLabel(walletMonth) + ' sonunda kalan'}</small>
+      <b class="w-big ${left < 0 ? 'neg' : ''}">${money(left)}</b>
+      <div class="w-io"><span class="in">↑ Gelir <b>${money(inc)}</b></span><span class="out">↓ Gider <b>${money(out)}</b></span></div>
+      <div class="w-meter" title="Gelirin ne kadarı harcandı"><i style="width:${pct}%"></i></div>
+      <div class="w-foot"><span>Gelirinin %${pct}'i harcandı</span><span>Günlük ort. gider ${money(out / Math.max(1, daysPassed))}</span></div>
+      <div class="w-total">Toplam bakiye (tüm zamanlar) <b class="${total < 0 ? 'neg' : ''}">${money(total)}</b></div>
+    </div>`;
+  if (cats.length){
+    h += `<h2><span class="hl"><span class="dot"></span>Nereye harcadım</span><span>${money(out)}</span></h2><div class="w-cats">` +
+      cats.map(([c, v]) => `<div class="w-cat"><span class="w-cat-n"><span class="cat" style="--cc:${W_COLORS[c] || W_COLORS.diger}">${wCatName('out', c)}</span></span>
+        <span class="w-cat-bar"><i style="width:${Math.max(4, v / maxC * 100)}%;background:${W_COLORS[c] || W_COLORS.diger}"></i></span>
+        <span class="w-cat-v">${money(v)}<small>%${Math.round(v / out * 100)}</small></span></div>`).join('') + `</div>`;
+  }
+  const list = M.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : (b.createdAt || 0) - (a.createdAt || 0)));
+  if (!list.length) h += emptyHTML(isCur ? 'Bu ay henüz hareket yok' : 'Bu ayda hareket yok', 'Aşağıya yaz: “560 yemek”, “15000 maaş”, “dün markete 340 tl”.');
+  const g = {}; list.forEach(t => (g[t.date] = g[t.date] || []).push(t));
+  Object.keys(g).forEach(d => {
+    const net = g[d].reduce((a, t) => a + (t.kind === 'in' ? t.amount : -t.amount), 0);
+    h += `<h2>${dLabel(d)}<span class="${net < 0 ? 'neg' : 'pos'}">${net < 0 ? '−' : '+'}${money(Math.abs(net))}</span></h2><div class="list">${g[d].map(txnHTML).join('')}</div>`;
+  });
+  return h;
+}
+
+function walletClick(act, b){
+  const id = b.dataset.id, t = id && txns.get(id);
+  switch (act){
+    case 'wPrev': walletMonth = shiftMonth(walletMonth, -1); render(); return true;
+    case 'wNext': walletMonth = shiftMonth(walletMonth, 1); render(); return true;
+    case 'wopen': wOpen = wOpen === id ? null : id; wConfirm = null; render(); return true;
+    case 'wkind': if (t && t.kind !== b.dataset.v){ patchTxn(id, { kind: b.dataset.v, cat: guessWCat(b.dataset.v, t.note || '') }); } return true;
+    case 'wcat': if (t) patchTxn(id, { cat: b.dataset.v }); return true;
+    case 'wdel1': wConfirm = id; render(); return true;
+    case 'wdel0': wConfirm = null; render(); return true;
+    case 'wdel2': if (t){ const copy = { ...t }; wOpen = wConfirm = null; removeTxn(id); toast('Silindi', () => queue({ op: 'upsert', tb: 'wallet', task: copy })); } return true;
+    case 'wAddKind': wKind = b.dataset.v; wCat = null; renderAddChips(); updateHint(); $('q').focus(); return true;
+    case 'wAddCat': wCat = wCat === b.dataset.v ? null : b.dataset.v; renderAddChips(); updateHint(); $('q').focus(); return true;
+  }
+  return false;
+}
+document.addEventListener('change', e => {
+  const el = e.target, id = el.dataset && el.dataset.id; if (!id || !txns.has(id)) return;
+  if (el.dataset.act === 'wdate' && el.value) patchTxn(id, { date: el.value });
+  if (el.dataset.act === 'wamount'){ const v = parseFloat(el.value.replace(/\./g, '').replace(',', '.')); if (v > 0) patchTxn(id, { amount: Math.round(v * 100) / 100 }); else toast('Geçerli bir tutar yaz'); }
+  if (el.dataset.act === 'wnote') patchTxn(id, { note: el.value.trim() || null });
+});
+
+/* ---------- Bölümler: Ajanda / Cüzdan ---------- */
+let section = (() => { try { return localStorage.getItem('gundem-section') || 'ajanda'; } catch(e){ return 'ajanda'; } })();
+function setSection(s){ section = s; try { localStorage.setItem('gundem-section', s); } catch(e){} openId = wOpen = null; lastTab = null; render(); }
+
 function render(){
   if ($('app').hidden) return;
   const d = pd(TODAY);
@@ -380,6 +563,16 @@ function render(){
   $('ring').classList.toggle('full', total > 0 && doneT === total);
   const hr = new Date().getHours();
   $('greet').textContent = hr < 5 ? 'İyi geceler' : hr < 12 ? 'Günaydın' : hr < 17 ? 'İyi günler' : hr < 22 ? 'İyi akşamlar' : 'İyi geceler';
+  const sec = $('sections'); sec.style.setProperty('--i', section === 'cuzdan' ? 1 : 0);
+  sec.innerHTML = '<span class="ind" aria-hidden="true"></span>' + [['ajanda','Ajanda'],['cuzdan','Cüzdan']].map(([k,l]) => `<button role="tab" data-sec="${k}" aria-selected="${section===k}">${l}</button>`).join('');
+  document.documentElement.dataset.section = section;
+  if (section === 'cuzdan'){
+    $('tabs').hidden = true; $('ring').hidden = true;
+    const v = $('view'); v.innerHTML = viewWallet();
+    if (lastTab !== 'wallet'){ v.classList.remove('swap'); void v.offsetWidth; v.classList.add('swap'); lastTab = 'wallet'; }
+    renderAddChips(); renderBanner(); growAll(); return;
+  }
+  $('tabs').hidden = false; $('ring').hidden = false;
   const ti = Math.max(0, TABS.findIndex(T => T.id === tab)), nav = $('tabs');
   nav.style.setProperty('--n', TABS.length); nav.style.setProperty('--i', ti);
   nav.innerHTML = '<span class="ind" aria-hidden="true"></span>' + TABS.map(T => { const n = T.count();
@@ -388,8 +581,12 @@ function render(){
   const v = $('view'); v.innerHTML = (TABS.find(T => T.id === tab) || TABS[0]).render();
   if (lastTab !== tab){ v.classList.remove('swap'); void v.offsetWidth; v.classList.add('swap'); lastTab = tab; }
   all().forEach(t => seen.add(t.id));
-  renderAddChips(); renderBanner();
+  renderAddChips(); renderBanner(); growAll();
 }
+// Uzun yazılar kesilmesin: düzenleme kutuları içeriğe göre uzar.
+function grow(el){ el.style.height = 'auto'; el.style.height = el.scrollHeight + 2 + 'px'; }
+function growAll(){ document.querySelectorAll('textarea.grow').forEach(grow); }
+document.addEventListener('input', e => { if (e.target.classList && e.target.classList.contains('grow')) grow(e.target); });
 let lastTab = null;
 function renderBanner(){
   const b = $('banner'); if (!b) return;
@@ -397,6 +594,12 @@ function renderBanner(){
   else b.hidden = true;
 }
 function renderAddChips(){
+  if (section === 'cuzdan'){
+    let h = [['out','Gider'],['in','Gelir']].map(([k,l]) => `<button type="button" class="chip ${k === 'in' ? 'k-in' : 'k-out'}" data-act="wAddKind" data-v="${k}" aria-pressed="${wKind===k}">${l}</button>`).join('');
+    h += Object.entries(W_CATS[wKind]).map(([k,v]) => `<button type="button" class="chip cat" style="--cc:${W_COLORS[k]}" data-act="wAddCat" data-v="${k}" aria-pressed="${wCat===k}">${v}</button>`).join('');
+    $('addChips').innerHTML = h; $('q').placeholder = 'Tutar ve ne için… (ör. 560 yemek, 15000 maaş)'; return;
+  }
+  $('q').placeholder = 'Görev ya da harcama… (ör. faturayı öde yarın, 560 tl yemek)';
   const dates = [[null,'Tarihsiz'],['today','Bugün'],['tomorrow','Yarın']];
   let h = dates.map(([k,l]) => `<button type="button" class="chip" data-add="date" data-v="${k}" aria-pressed="${addDate===k}">${l}</button>`).join('');
   h += `<label class="chip" aria-pressed="${addDate==='custom'}">📅 <input type="date" id="addDateInp" value="${customDate}" aria-label="Tarih seç"></label>`;
@@ -430,7 +633,11 @@ function openThemes(){
       <span class="sw-dot" style="background:linear-gradient(135deg,${p.bg} 0 50%,${p.accent} 50% 100%);border-color:${p.line}"></span>${esc(T.name)}</button>`; }).join('');
   $('sheet').innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Tema ve renkler">
     <h3>Tema ve renkler</h3><p class="sub">Dokunduğun anda uygulanır. Bu cihazda hatırlanır.</p>
-    <div class="scroll"><div class="chips">${modes}</div><div class="swatches">${sw}</div></div>
+    <div class="scroll"><div class="chips">${modes}</div><div class="swatches">${sw}</div>
+      <h2 style="margin-top:18px">Akıcı mod</h2>
+      <p class="sub" style="margin-top:-4px">Bulanık cam ve hareketli ışıkları kapatır. Eski telefonlarda donmayı önler.</p>
+      <div class="chips">${[['auto','Otomatik'],['on','Açık'],['off','Kapalı']].map(([k,l]) => `<button class="chip" data-act="lite" data-v="${k}" aria-pressed="${litePref===k}">${l}</button>`).join('')}</div>
+    </div>
     <div class="foot"><button class="btn" data-act="closesheet">Tamam</button></div></div>`;
   $('sheet').hidden = false;
 }
@@ -441,6 +648,7 @@ function openMenu(){
     <h3>Menü</h3><p class="sub">Gündem ${VERSION}${BUILD.build ? ' · sürüm 1.0.' + BUILD.build : ''}${IS_ANDROID ? ' · Android' : IS_DESKTOP ? ' · Windows' : ''}</p>
     <div class="scroll">
       <button class="menu-item" data-act="themes">Tema ve renkler<small>${esc(THEMES[themePref.id].name)} · ${({system:'Sistem',light:'Açık',dark:'Koyu'})[themePref.mode]}</small></button>
+      ${IS_DESKTOP ? `<button class="menu-item" data-act="updCheck">Güncellemeleri denetle<small id="updStatus">${esc(updText(deskUpd))}</small></button>${deskUpd.state === 'error' ? '<button class="menu-item" data-act="updLog">Güncelleme günlüğünü aç<small>Hata ayrıntıları burada</small></button>' : ''}` : ''}
       <button class="menu-item" data-act="backup">Yedek indir<small>Bütün görevlerini bir dosya olarak kaydeder.</small></button>
       <label class="menu-item" for="restoreInp">Yedekten geri yükle<small>Daha önce indirdiğin yedek dosyasını seç. Mevcut görevler silinmez.</small></label>
       <input type="file" id="restoreInp" accept="application/json,.json" hidden>
@@ -507,6 +715,7 @@ function toast(msg, undo){
 
 /* ---------- 5. Olaylar ---------- */
 document.addEventListener('click', e => {
+  const sb2 = e.target.closest('[data-sec]'); if (sb2){ setSection(sb2.dataset.sec); return; }
   const tb = e.target.closest('nav button'); if (tb){ tab = tb.dataset.tab; openId = null; render(); return; }
   const ad = e.target.closest('[data-add]');
   if (ad){ if (ad.dataset.add === 'date') addDate = ad.dataset.v === 'null' ? null : ad.dataset.v; else addCat = addCat === ad.dataset.v ? null : ad.dataset.v;
@@ -515,6 +724,7 @@ document.addEventListener('click', e => {
   const id = b.dataset.id, t = id && tasks.get(id), act = b.dataset.act;
   if (voiceClick(act, b)) return;
   if (calClick(act, b)) return;
+  if (walletClick(act, b)) return;
   switch (act){
     case 'open': openId = openId === id ? null : id; confirmDel = null; render(); break;
     case 'toggle': if (!t) break;
@@ -540,14 +750,18 @@ document.addEventListener('click', e => {
     case 'del0': confirmDel = null; render(); break;
     case 'del2': openId = null; confirmDel = null; removeTask(id); toast('Silindi'); break;
     case 'picker': openPicker(); break;
-    case 'pickt': if (t){ patch(id, { pickedFor: t.pickedFor === TODAY ? null : TODAY }); refreshSheet(); } break;
+    case 'pickt': if (t){ const on = t.pickedFor !== TODAY; b.setAttribute('aria-pressed', on); patch(id, { pickedFor: on ? TODAY : null }); } break;
     case 'closesheet': closeSheet(); break;
     case 'rollall': rollAll(); break;
     case 'import': importOld(); break;
     case 'backup': backup(); break;
+    case 'updCheck': if (IS_DESKTOP){ if (deskUpd.state === 'ready') window.gundemDesktop.installUpdate(); else window.gundemDesktop.checkUpdates().then(setDeskUpd); } break;
+    case 'updLog': if (IS_DESKTOP) window.gundemDesktop.openUpdateLog(); break;
+    case 'updInstall': if (IS_DESKTOP) window.gundemDesktop.installUpdate(); break;
     case 'themes': openThemes(); break;
     case 'theme': setTheme({ id: b.dataset.v }); openThemes(); break;
     case 'mode': setTheme({ mode: b.dataset.v }); openThemes(); break;
+    case 'lite': setLite(b.dataset.v); openThemes(); break;
     case 'logout': closeSheet(); sb.auth.signOut(); break;
   }
 });
@@ -646,6 +860,8 @@ function splitSpeech(text){
     if (!raw || !raw.trim()) continue;
     const p = parseQuick(raw.trim());
     if (p.date) cur = p.date;
+    const mny = parseMoney(raw.trim(), false);
+    if (mny){ out.push({ money: true, ...mny, title: mny.note }); continue; }
     const title = cleanTask(p.title);
     if (title.length < 2 || /^(?:şey|yani|tamam|peki|hmm+|ee+|ıı+|evet|hayır)$/i.test(title)) continue;
     out.push({ title, date: cur, cat: guessCat(title) });
@@ -654,9 +870,26 @@ function splitSpeech(text){
 }
 
 function micSupported(){ return !!SR; }
+// Bazı telefonlar aynı cümleyi üst üste tekrar gönderiyor ("TÜBİTAK bitirme TÜBİTAK bitirme ...").
+// Art arda tekrarlanan kelime gruplarını teke indir.
+function collapseRepeats(text){
+  let w = text.split(/\s+/).filter(Boolean), changed = true;
+  while (changed){
+    changed = false;
+    for (let k = Math.floor(w.length / 2); k >= 1 && !changed; k--){
+      for (let i = 0; i + 2 * k <= w.length; i++){
+        let same = true;
+        for (let j = 0; j < k; j++) if (low(w[i + j]) !== low(w[i + k + j])){ same = false; break; }
+        if (same){ w.splice(i + k, k); changed = true; break; }
+      }
+    }
+  }
+  return w.join(' ');
+}
 function finishVoice(){
   clearTimeout(silenceT); rec = null;
   if (sheetKind !== 'listen') return;
+  heard = collapseRepeats(heard);
   voiceItems = splitSpeech(heard);
   if (!voiceItems.length){ closeSheet(); if (heard) toast('Bundan bir görev çıkaramadım, tekrar dene.'); return; }
   openReview();
@@ -670,7 +903,7 @@ async function startNativeVoice(){
   heard = ''; voiceItems = [];
   await NativeSpeech.removeAllListeners();
   NativeSpeech.addListener('partialResults', d => {
-    const m = d && d.matches && d.matches[0]; if (m) heard = m;
+    const m = d && d.matches && d.matches[0]; if (m) heard = collapseRepeats(m);
     const el = $('vTxt'); if (el) el.textContent = heard || '…';
     clearTimeout(silenceT); silenceT = setTimeout(() => NativeSpeech.stop(), 2600);
   });
@@ -683,14 +916,16 @@ function startVoice(){
   if (NativeSpeech){ startNativeVoice(); return; }
   if (!SR){ toast('Bu tarayıcı sesle yazmayı desteklemiyor. Chrome ya da Edge kullan.'); return; }
   heard = ''; voiceItems = [];
-  rec = new SR(); rec.lang = 'tr-TR'; rec.interimResults = true; rec.continuous = true; rec.maxAlternatives = 1;
+  // Android Chrome'da "continuous" modu sonuçları tekrar tekrar ekliyor; orada tek seferlik dinle.
+  const ANDROID_WEB = /Android/i.test(navigator.userAgent);
+  rec = new SR(); rec.lang = 'tr-TR'; rec.interimResults = true; rec.continuous = !ANDROID_WEB; rec.maxAlternatives = 1;
   let finalTxt = '';
   rec.onresult = e => {
-    let interim = '';
-    for (let i = e.resultIndex; i < e.results.length; i++){
-      const r = e.results[i]; if (r.isFinal) finalTxt += ' ' + r[0].transcript; else interim += ' ' + r[0].transcript;
-    }
-    heard = (finalTxt + ' ' + interim).replace(/\s+/g,' ').trim();
+    // Her seferinde baştan kur: eklemeli toplama tekrarlara yol açıyordu.
+    let txt = '';
+    for (let i = 0; i < e.results.length; i++) txt += ' ' + e.results[i][0].transcript;
+    if (ANDROID_WEB && e.results.length) txt = e.results[e.results.length - 1][0].transcript;
+    heard = collapseRepeats(txt.replace(/\s+/g,' ').trim());
     const el = $('vTxt'); if (el) el.textContent = heard || '…';
     clearTimeout(silenceT); silenceT = setTimeout(() => rec && rec.stop(), 2600);
   };
@@ -725,17 +960,23 @@ function vDateChips(it, i){
 }
 function openReview(){
   sheetKind = 'review';
-  const cards = voiceItems.map((it, i) => `<div class="v-card" style="--d:${i*70}ms">
-      <div class="v-top"><input type="text" class="v-title" data-i="${i}" value="${esc(it.title)}" aria-label="Görev">
+  const cards = voiceItems.map((it, i) => it.money ? `<div class="v-card money" style="--d:${i*70}ms">
+      <div class="v-top"><span class="v-badge ${it.kind}">Cüzdan · ${it.kind === 'in' ? 'Gelir' : 'Gider'} ${money(it.amount)}</span>
+        <button class="v-x" data-act="vdel" data-i="${i}" aria-label="Çıkar">×</button></div>
+      <textarea rows="1" class="v-title grow" data-i="${i}" aria-label="Açıklama">${esc(it.title)}</textarea>
+      <div class="chips">${[['out','Gider'],['in','Gelir']].map(([k,l]) => `<button type="button" class="chip sm" data-act="vkind" data-i="${i}" data-v="${k}" aria-pressed="${it.kind===k}">${l}</button>`).join('')}
+        ${Object.entries(W_CATS[it.kind]).map(([k,v]) => `<button type="button" class="chip sm cat" style="--cc:${W_COLORS[k]}" data-act="vwcat" data-i="${i}" data-v="${k}" aria-pressed="${it.cat===k}">${v}</button>`).join('')}</div>
+    </div>` : `<div class="v-card" style="--d:${i*70}ms">
+      <div class="v-top"><textarea rows="1" class="v-title grow" data-i="${i}" aria-label="Görev">${esc(it.title)}</textarea>
         <button class="v-x" data-act="vdel" data-i="${i}" aria-label="Çıkar">×</button></div>
       <div class="chips">${vDateChips(it, i)}</div>
       <div class="chips">${Object.entries(CATS).map(([k,v]) => `<button type="button" class="chip sm cat" style="--cc:var(--c-${k})" data-act="vcat" data-i="${i}" data-v="${k}" aria-pressed="${it.cat===k}">${v}</button>`).join('')}</div>
     </div>`).join('');
   $('sheet').innerHTML = `<div class="sheet" role="dialog" aria-modal="true" aria-label="Anladıklarım">
-    <h3>${voiceItems.length} iş anladım</h3><p class="sub">“${esc(heard)}”</p>
+    <h3>${voiceItems.length} şey anladım</h3><p class="sub">“${esc(heard)}”</p>
     <div class="scroll">${cards || '<div class="empty">Liste boş.</div>'}</div>
     <div class="foot"><button class="btn ghost" data-act="vagain">${MIC_SVG} Tekrar</button><button class="btn glow" data-act="vadd" ${voiceItems.length?'':'disabled'}>Hepsini ekle</button></div></div>`;
-  $('sheet').hidden = false;
+  $('sheet').hidden = false; growAll();
 }
 function voiceClick(act, b){
   const i = +b.dataset.i;
@@ -747,10 +988,16 @@ function voiceClick(act, b){
     case 'vdel': voiceItems.splice(i, 1); voiceItems.length ? openReview() : closeSheet(); return true;
     case 'vdate': voiceItems[i].date = b.dataset.v || null; openReview(); return true;
     case 'vcat': voiceItems[i].cat = voiceItems[i].cat === b.dataset.v ? null : b.dataset.v; openReview(); return true;
+    case 'vkind': { const it = voiceItems[i]; if (it.kind !== b.dataset.v){ it.kind = b.dataset.v; it.cat = guessWCat(it.kind, it.title); } openReview(); return true; }
+    case 'vwcat': voiceItems[i].cat = b.dataset.v; openReview(); return true;
     case 'vadd': {
-      const n = voiceItems.filter(it => it.title.trim()).length;
-      voiceItems.forEach(it => { if (it.title.trim()) addTask({ title: it.title.trim(), date: it.date, cat: it.cat }); });
-      voiceItems = []; closeSheet(); toast(n + ' iş eklendi'); return true; }
+      let nt = 0, nm = 0;
+      voiceItems.forEach(it => {
+        const ttl = (it.title || '').trim();
+        if (it.money){ addTxn({ kind: it.kind, amount: it.amount, cat: it.cat, note: ttl || null, date: it.date }); nm++; }
+        else if (ttl){ addTask({ title: ttl, date: it.date, cat: it.cat }); nt++; }
+      });
+      voiceItems = []; closeSheet(); toast([nt ? nt + ' iş' : '', nm ? nm + ' cüzdan kaydı' : ''].filter(Boolean).join(' ve ') + ' eklendi'); return true; }
     case 'noop': return true;
   }
   return false;
@@ -761,14 +1008,32 @@ if (!SR && !NativeSpeech) { const m = $('micBtn'); if (m) m.hidden = true; }
 
 const q = $('q');
 const chipDate = () => addDate === 'today' ? TODAY : addDate === 'tomorrow' ? addDays(TODAY, 1) : (addDate === 'custom' && customDate) ? customDate : null;
+// Yazılan cümle görev mi, para mı? Para ise cüzdana gider.
+function moneyFromInput(raw){
+  const m = parseMoney(raw, section === 'cuzdan'); if (!m) return null;
+  if (section === 'cuzdan' && !IN_RE.test(low(raw))){ if (m.kind !== wKind){ m.kind = wKind; m.cat = guessWCat(wKind, raw); } }
+  if (wCat && section === 'cuzdan' && W_CATS[m.kind][wCat]) m.cat = wCat;
+  return m;
+}
 function updateHint(){
-  const h = $('hint'), p = parseQuick(q.value), d = p.date || chipDate();
+  const h = $('hint'), raw = q.value.trim(), mny = raw && moneyFromInput(raw);
+  if (mny){ h.textContent = `→ Cüzdan · ${mny.kind === 'in' ? 'Gelir' : 'Gider'} ${money(mny.amount)} · ${wCatName(mny.kind, mny.cat)}${mny.date !== TODAY ? ' · ' + dLabel(mny.date) : ''}`; h.hidden = false; return; }
+  if (section === 'cuzdan'){ if (raw){ h.textContent = '→ Tutarı da yaz, ör. 560 yemek'; h.hidden = false; } else h.hidden = true; return; }
+  const p = parseQuick(q.value), d = p.date || chipDate();
   if (q.value.trim() && d){ h.textContent = '→ ' + dLabel(d) + (d <= TODAY ? ' · bugünün listesine girer' : ' · o sabah otomatik seçilir'); h.hidden = false; } else h.hidden = true;
 }
 q.addEventListener('input', updateHint);
 $('addForm').addEventListener('submit', e => {
   e.preventDefault();
   const raw = q.value.trim(); if (!raw) return;
+  const mny = moneyFromInput(raw);
+  if (mny){
+    const id = uuid(); queue({ op: 'upsert', tb: 'wallet', task: { id, createdAt: Date.now(), ...mny } });
+    q.value = ''; updateHint();
+    toast(`Cüzdana eklendi · ${mny.kind === 'in' ? '+' : '−'}${money(mny.amount)} ${wCatName(mny.kind, mny.cat)}`, () => removeTxn(id));
+    return;
+  }
+  if (section === 'cuzdan'){ toast('Tutarı da yaz, ör. “560 yemek”'); return; }
   const p = parseQuick(raw), date = p.date || chipDate();
   addTask({ title: p.title || raw, date, cat: addCat });
   q.value = ''; updateHint();
@@ -812,12 +1077,13 @@ $('authForm').addEventListener('submit', async e => {
 function showApp(user){
   userId = user.id; sessionEmail = user.email || '';
   tasks.clear(); lsGet(K_CACHE(), []).forEach(t => tasks.set(t.id, t)); outbox = lsGet(K_OUT(), []);
+  txns.clear(); lsGet(K_WCACHE(), []).forEach(t => txns.set(t.id, t));
   $('auth').hidden = true; $('app').hidden = false; $('addBar').hidden = false;
   render(); flush().then(reload); startRealtime();
   setTimeout(checkAppUpdate, 2500);
 }
 function showAuth(){
-  userId = null; tasks.clear(); outbox = [];
+  userId = null; tasks.clear(); txns.clear(); outbox = [];
   $('app').hidden = true; $('addBar').hidden = true; $('auth').hidden = false;
 }
 
@@ -884,3 +1150,33 @@ document.addEventListener('click', e => {
   const g = e.target.closest('[data-act=updGo]'); if (g) startUpdate(g);
 });
 document.addEventListener('visibilitychange', () => { if (!document.hidden){ updChecked = false; setTimeout(checkAppUpdate, 1500); } });
+
+/* ---------- Windows güncelleme durumu ---------- */
+let deskUpd = { state: 'idle' }, deskVer = '';
+function updText(u){
+  switch (u.state){
+    case 'checking': return 'Denetleniyor…';
+    case 'latest': return 'Güncelsin · sürüm ' + (deskVer || u.version || '');
+    case 'available': return 'Yeni sürüm bulundu (' + u.version + '), indiriliyor…';
+    case 'downloading': return 'İndiriliyor… %' + (u.percent || 0);
+    case 'ready': return 'Yeni sürüm hazır · yeniden başlatmak için dokun';
+    case 'error': return 'Denetlenemedi: ' + (u.message || 'bilinmeyen hata');
+    case 'nofeed': return 'Güncelleme adresi bu sürümde yok, yeni sürümü elle kur';
+    case 'dev': return 'Geliştirme sürümü';
+    default: return 'Sürüm ' + deskVer + ' · denetlemek için dokun';
+  }
+}
+function setDeskUpd(u){
+  if (!u) return; deskUpd = u;
+  const el = document.getElementById('updStatus'); if (el) el.textContent = updText(u);
+  if (u.state === 'ready'){
+    const b = $('updBar');
+    b.innerHTML = `<span><b>Yeni sürüm hazır</b><small>${esc(u.version || '')}</small></span><button class="btn glow" data-act="updInstall">Yeniden başlat</button><button class="v-x" data-act="updClose" aria-label="Kapat">×</button>`;
+    b.hidden = false;
+  }
+}
+if (IS_DESKTOP){
+  window.gundemDesktop.version().then(v => { deskVer = v; });
+  window.gundemDesktop.updateStatus().then(setDeskUpd);
+  window.gundemDesktop.onUpdate(setDeskUpd);
+}
