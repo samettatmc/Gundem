@@ -1,0 +1,104 @@
+# Gündem: her "Push"ta Windows ve Android uygulamalarını derler ve yeni sürüm olarak yayınlar.
+name: Uygulamaları derle
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_NUMBER: ${{ github.run_number }}
+  UPDATE_TOKEN: ${{ secrets.UPDATE_TOKEN }}
+
+jobs:
+  windows:
+    name: Windows uygulaması
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install --no-audit --no-fund
+      - run: node scripts/write-build-info.js
+      - run: node scripts/copy-web.js
+      - run: npx electron-builder --win --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+
+  android:
+    name: Android uygulaması
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 21 }
+      - name: İmza anahtarı var mı?
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE }}
+        run: |
+          if [ -z "$KS" ]; then echo "::error::ANDROID_KEYSTORE adlı gizli bilgi eklenmemiş. BENIOKU.md'deki adıma bak."; exit 1; fi
+      - run: npm install --no-audit --no-fund
+      - run: node scripts/write-build-info.js
+      - run: node scripts/copy-web.js
+      - run: npx cap add android
+      - run: npx capacitor-assets generate --android --iconBackgroundColor '#141E33' --iconBackgroundColorDark '#141E33' --splashBackgroundColor '#0E131B' --splashBackgroundColorDark '#0E131B'
+      - run: node scripts/patch-android.js
+      - run: npx cap sync android
+      - name: APK derle ve imzala
+        env:
+          KS: ${{ secrets.ANDROID_KEYSTORE }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          echo "$KS" | base64 -d > "$RUNNER_TEMP/gundem.jks"
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/gundem.jks" \
+            -Pandroid.injected.signing.store.password="$KS_PASS" \
+            -Pandroid.injected.signing.key.alias=gundem \
+            -Pandroid.injected.signing.key.password="$KS_PASS"
+          cp app/build/outputs/apk/release/app-release.apk ../Gundem.apk
+      - name: APK'yı Supabase'e yükle (uygulama içi güncelleme için)
+        env:
+          SB_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$SB_KEY" ]; then echo "::warning::SUPABASE_SERVICE_KEY eklenmemiş: telefon yeni sürümü göremez."; exit 0; fi
+          SB_URL=$(grep -o 'https://[a-z0-9]*\.supabase\.co' config.js | head -1)
+          up() { curl -sS --fail-with-body -X POST "$SB_URL/storage/v1/object/surumler/$1" \
+            -H "Authorization: Bearer $SB_KEY" -H "apikey: $SB_KEY" -H "x-upsert: true" -H "cache-control: max-age=0" -H "Content-Type: $2" --data-binary "@$3"; echo; }
+          up Gundem.apk application/vnd.android.package-archive Gundem.apk
+          NOTE=$(printf '%s' "${NOTES:-Yeni sürüm}" | head -1 | cut -c1-80)
+          node -e "require('fs').writeFileSync('version.json', JSON.stringify({ build: +process.env.BUILD_NUMBER, note: process.argv[1] }))" "$NOTE"
+          up version.json application/json version.json
+      - uses: actions/upload-artifact@v4
+        with: { name: android, path: Gundem.apk }
+
+  yayinla:
+    name: Yeni sürümü yayınla
+    needs: [windows, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out, merge-multiple: true }
+      - name: Sürüm oluştur
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          ls -la out
+          gh release create "v1.0.${BUILD_NUMBER}" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Gündem 1.0.${BUILD_NUMBER}" \
+            --notes "${NOTES:-Yeni sürüm}" \
+            --latest
